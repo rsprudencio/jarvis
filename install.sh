@@ -45,6 +45,162 @@ fail() { echo -e "  ${RED}✗${NC} $1"; }
 warn() { echo -e "  ${YELLOW}!${NC} $1"; }
 info() { echo -e "  ${BLUE}→${NC} $1"; }
 
+# ── Helpers ──
+
+# One bounded health probe: a server that accepts TCP but never answers (a
+# wedged event loop) costs at most ~2s instead of hanging the installer.
+health_ok() {
+    curl -sf --connect-timeout 1 --max-time 2 "$1" > /dev/null 2>&1
+}
+
+# wait_for_health <max-seconds> <url>...: true once every URL answers.
+wait_for_health() {
+    local deadline=$((SECONDS + $1)) url all_ok
+    shift
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        all_ok=true
+        for url in "$@"; do
+            health_ok "$url" || { all_ok=false; break; }
+        done
+        [ "$all_ok" = true ] && return 0
+        sleep 1
+    done
+    return 1
+}
+
+# Prints "true" when config.json enables server.auth (same truthiness as
+# jarvis_common.auth.get_auth_config), else "false".
+read_auth_enabled() {
+    local config="$1"
+    if [ ! -f "$config" ]; then
+        echo "false"
+        return 0
+    fi
+    python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    cfg = json.load(f)
+server = cfg.get('server') if isinstance(cfg, dict) else None
+auth = server.get('auth') if isinstance(server, dict) else None
+print('true' if isinstance(auth, dict) and auth.get('enabled', False) else 'false')
+" "$config" 2>/dev/null || echo "false"
+}
+
+# generate_compose_file <image> <vault-path> <jarvis-home> <auth-enabled>
+# MCP ports publish on loopback only unless auth is enabled; the explorer is
+# always loopback-only.
+generate_compose_file() {
+    local image="$1" vault_path="$2" jarvis_home="$3" auth_enabled="$4"
+    local bind="127.0.0.1:"
+    local ports_note="Loopback-only: enable server.auth in config.json and re-run the installer to expose on the network"
+    if [ "$auth_enabled" = "true" ]; then
+        bind=""
+        ports_note="All interfaces: server.auth.enabled=true in config.json"
+    fi
+    cat << COMPOSEEOF
+# Jarvis — single-container deployment with embedded PostgreSQL
+services:
+  jarvis:
+    image: $image
+    ports:
+      # $ports_note
+      - "${bind}8741:8741"
+      - "${bind}8742:8742"
+      - "${bind}8744:8744"
+      - "127.0.0.1:\${JARVIS_EXPLORER_PORT:-8750}:8750"
+    volumes:
+      - "$vault_path:/vault"
+      - "$jarvis_home:/config"
+      - pgdata:/var/lib/postgresql/data
+    extra_hosts:
+      # No-op on Docker Desktop (macOS); required for host.docker.internal
+      # to resolve on Linux engines.
+      - "host.docker.internal:host-gateway"
+    environment:
+      - JARVIS_HOME=/config
+      - JARVIS_VAULT_PATH=/vault
+      - TODOIST_API_TOKEN=\${TODOIST_API_TOKEN:-}
+      # Optional: lets you generate contextual document summaries in-container
+      #   docker exec -w /app/jarvis-core <container> python bin/generate_summaries.py
+      # No runtime path calls an LLM; leave it empty to generate on the host with
+      # the OAuth 'claude' CLI instead.
+      - ANTHROPIC_API_KEY=\${ANTHROPIC_API_KEY:-}
+      - AURORA_PASSWORD=\${AURORA_PASSWORD:-}
+    stop_grace_period: 30s
+    restart: unless-stopped
+    # Bounded, rotated container logs (json-file grows without limit on the
+    # same VM disk as the database volume).
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8741/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+volumes:
+  pgdata:
+COMPOSEEOF
+}
+
+# Prints the path of a previously installed Jarvis launcher, if any.
+find_installed_launcher() {
+    local candidate
+    for candidate in "$(command -v jarvis 2>/dev/null || true)" "$HOME/.local/bin/jarvis" "/usr/local/bin/jarvis"; do
+        case "$candidate" in /*) ;; *) continue ;; esac
+        if [ -f "$candidate" ] && grep -q "Jarvis AI Assistant launcher" "$candidate" 2>/dev/null; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# install_managed_file <src> <dst> <label>: copy a shipped file (launcher,
+# statusline) over its installed copy on EVERY install when the content
+# differs, so fixes reach existing users. The previous copy is backed up to
+# $JARVIS_HOME/backups/installed/ (dir 700, file 600); the swap is an atomic
+# rename so a running copy is never read half-written. Symlinks (dev setups)
+# are left alone.
+install_managed_file() {
+    local src="$1" dst="$2" label="$3"
+    local backup_dir="$JARVIS_HOME/backups/installed"
+    local backup tmp
+
+    if [ -L "$dst" ]; then
+        info "$label is a symlink, leaving it as-is: $dst"
+        return 0
+    fi
+    if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
+        ok "$label up to date: $dst"
+        return 0
+    fi
+    if [ -f "$dst" ]; then
+        mkdir -p "$backup_dir" || return 1
+        chmod 700 "$JARVIS_HOME/backups" "$backup_dir" || return 1
+        backup="$backup_dir/$(basename "$dst").$(date +%Y%m%d-%H%M%S).bak"
+        cp "$dst" "$backup" || return 1
+        chmod 600 "$backup" || return 1
+        info "Previous $label backed up: $backup"
+    fi
+    tmp="$dst.tmp.$$"
+    if ! cp "$src" "$tmp" || ! chmod 755 "$tmp" || ! mv -f "$tmp" "$dst"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    ok "Installed $label: $dst"
+}
+
+# Tests source this file for its helpers only (tests/test_deploy_scripts.py).
+if [ "${JARVIS_INSTALL_LIB_ONLY:-}" = "1" ]; then
+    # shellcheck disable=SC2317  # exit is reached when executed, not sourced
+    return 0 2>/dev/null || exit 0
+fi
+
 if [ "$HAS_TTY" = false ]; then
     warn "No terminal detected — using all defaults (non-interactive mode)"
     echo ""
@@ -370,7 +526,17 @@ fi
 
 # The shipped launcher and statusline are Claude-specific. Codex loads Jarvis
 # through its plugin manifest, so installing either would be misleading.
+EXISTING_LAUNCHER=""
 if [ "$JARVIS_HARNESS" = "claude" ]; then
+    EXISTING_LAUNCHER=$(find_installed_launcher || true)
+fi
+if [ -n "$EXISTING_LAUNCHER" ]; then
+    # Already opted in on an earlier install: refresh it rather than re-ask,
+    # so launcher fixes reach existing installs.
+    echo -e "  ${BOLD}Shell Integration${NC}"
+    info "'jarvis' command already installed ($EXISTING_LAUNCHER); it will be refreshed if it changed"
+    SHELL_SETUP="Y"
+elif [ "$JARVIS_HARNESS" = "claude" ]; then
     echo -e "  ${BOLD}Shell Integration${NC}"
     echo "  The 'jarvis' command launches Claude with your Jarvis identity."
     echo -e "  ${YELLOW}⚠️  Highly recommended — this is the only way to make Claude fully impersonate Jarvis.${NC}"
@@ -436,9 +602,12 @@ if [ "$SHELL_SETUP" = "Y" ] || [ "$SHELL_SETUP" = "y" ]; then
         fi
     done
 
-    # Detect best install directory
+    # Detect best install directory (an existing launcher stays where it is,
+    # otherwise the stale copy would keep shadowing the new one on PATH)
     INSTALL_DIR=""
-    if [ -d "$HOME/.local/bin" ] && echo "$PATH" | grep -q "$HOME/.local/bin"; then
+    if [ -n "$EXISTING_LAUNCHER" ]; then
+        INSTALL_DIR="$(dirname "$EXISTING_LAUNCHER")"
+    elif [ -d "$HOME/.local/bin" ] && echo "$PATH" | grep -q "$HOME/.local/bin"; then
         INSTALL_DIR="$HOME/.local/bin"
     elif [ -d "/usr/local/bin" ] && [ -w "/usr/local/bin" ]; then
         INSTALL_DIR="/usr/local/bin"
@@ -447,12 +616,11 @@ if [ "$SHELL_SETUP" = "Y" ] || [ "$SHELL_SETUP" = "y" ]; then
         mkdir -p "$INSTALL_DIR"
     fi
 
-    # Install the jarvis executable
+    # Install (or refresh) the jarvis executable
     SHELL_SCRIPT="$PLUGIN_DIR/shell/jarvis.sh"
     if [ -f "$SHELL_SCRIPT" ]; then
-        cp "$SHELL_SCRIPT" "$INSTALL_DIR/jarvis"
-        chmod +x "$INSTALL_DIR/jarvis"
-        ok "Installed: $INSTALL_DIR/jarvis"
+        install_managed_file "$SHELL_SCRIPT" "$INSTALL_DIR/jarvis" "launcher" \
+            || warn "Could not write $INSTALL_DIR/jarvis — copy manually: cp \"$SHELL_SCRIPT\" \"$INSTALL_DIR/jarvis\""
     else
         warn "jarvis.sh not found at $SHELL_SCRIPT"
     fi
@@ -500,8 +668,7 @@ echo ""
 # (ports 8751/8752); the container reaches them via host.docker.internal.
 
 echo -e "  ${BOLD}Native Host Inference${NC}"
-if curl -sf http://127.0.0.1:8751/health >/dev/null 2>&1 \
-    && curl -sf http://127.0.0.1:8752/health >/dev/null 2>&1; then
+if health_ok http://127.0.0.1:8751/health && health_ok http://127.0.0.1:8752/health; then
     ok "Host inference services already running (8751 embedding, 8752 reranker)"
 else
     if [ "$(uname -s)" != "Darwin" ] || [ "$(uname -m)" != "arm64" ]; then
@@ -525,7 +692,7 @@ else
     HOST_INF_RAW="https://raw.githubusercontent.com/rsprudencio/jarvis/${JARVIS_REF:-master}/host-inference"
     mkdir -p "$HOST_INF_DIR"
     for HOST_INF_FILE in host_models.py launchd.py configure.py models.json; do
-        if ! curl -fsSL "$HOST_INF_RAW/$HOST_INF_FILE" -o "$HOST_INF_DIR/$HOST_INF_FILE"; then
+        if ! curl -fsSL --connect-timeout 10 --max-time 300 "$HOST_INF_RAW/$HOST_INF_FILE" -o "$HOST_INF_DIR/$HOST_INF_FILE"; then
             fail "Could not download host-inference tooling ($HOST_INF_FILE)"
             exit 1
         fi
@@ -545,14 +712,9 @@ else
     fi
 
     HOST_INF_OK=false
-    for i in $(seq 1 60); do
-        if curl -sf http://127.0.0.1:8751/health >/dev/null 2>&1 \
-            && curl -sf http://127.0.0.1:8752/health >/dev/null 2>&1; then
-            HOST_INF_OK=true
-            break
-        fi
-        sleep 1
-    done
+    if wait_for_health 60 http://127.0.0.1:8751/health http://127.0.0.1:8752/health; then
+        HOST_INF_OK=true
+    fi
     if [ "$HOST_INF_OK" = true ]; then
         ok "Host inference services healthy"
     else
@@ -583,77 +745,45 @@ echo ""
 
 # Write docker-compose.yml for user
 COMPOSE_FILE="$JARVIS_HOME/docker-compose.yml"
-cat > "$COMPOSE_FILE" << COMPOSEEOF
-# Jarvis — single-container deployment with embedded PostgreSQL
-services:
-  jarvis:
-    image: $DOCKER_IMAGE
-    ports:
-      - "8741:8741"
-      - "8742:8742"
-      - "8744:8744"
-      - "127.0.0.1:\${JARVIS_EXPLORER_PORT:-8750}:8750"
-    volumes:
-      - "$VAULT_PATH:/vault"
-      - "$JARVIS_HOME:/config"
-      - pgdata:/var/lib/postgresql/data
-    extra_hosts:
-      # No-op on Docker Desktop (macOS); required for host.docker.internal
-      # to resolve on Linux engines.
-      - "host.docker.internal:host-gateway"
-    environment:
-      - JARVIS_HOME=/config
-      - JARVIS_VAULT_PATH=/vault
-      - TODOIST_API_TOKEN=\${TODOIST_API_TOKEN:-}
-      # Optional: lets you generate contextual document summaries in-container
-      #   docker exec -w /app/jarvis-core <container> python bin/generate_summaries.py
-      # No runtime path calls an LLM; leave it empty to generate on the host with
-      # the OAuth 'claude' CLI instead.
-      - ANTHROPIC_API_KEY=\${ANTHROPIC_API_KEY:-}
-      - AURORA_PASSWORD=\${AURORA_PASSWORD:-}
-    stop_grace_period: 30s
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8741/health"]
-      interval: 30s
-      timeout: 5s
-      start_period: 30s
-      retries: 3
-
-volumes:
-  pgdata:
-COMPOSEEOF
+AUTH_ENABLED=$(read_auth_enabled "$JARVIS_HOME/config.json")
+generate_compose_file "$DOCKER_IMAGE" "$VAULT_PATH" "$JARVIS_HOME" "$AUTH_ENABLED" > "$COMPOSE_FILE"
 ok "Docker Compose file: $COMPOSE_FILE"
+if [ "$AUTH_ENABLED" = "true" ]; then
+    info "server.auth is enabled — MCP ports published on all interfaces"
+else
+    info "MCP ports bound to 127.0.0.1 (enable server.auth in config.json and re-run to expose them)"
+fi
 
 # Start the container
 info "Starting Jarvis container..."
 if docker compose -f "$COMPOSE_FILE" up -d 2>&1; then
     # Wait for health
     HEALTH_OK=false
-    for i in $(seq 1 30); do
-        if curl -sf http://localhost:8741/health > /dev/null 2>&1; then
-            HEALTH_OK=true
-            break
-        fi
-        sleep 1
-    done
+    if wait_for_health 30 http://localhost:8741/health; then
+        HEALTH_OK=true
+    fi
 
     if [ "$HEALTH_OK" = true ]; then
         ok "Jarvis MCP server is running"
-        HEALTH_RESP=$(curl -sf http://localhost:8741/health 2>/dev/null)
+        HEALTH_RESP=$(curl -sf --connect-timeout 1 --max-time 2 http://localhost:8741/health 2>/dev/null || true)
         # Parse and display key health info
-        PG_STATUS=$($PYTHON_CMD -c "import json,sys; d=json.loads(sys.argv[1]); pg=d.get('postgres',{}); print(f\"pg:{pg.get('status','?')}({pg.get('doc_count',0)})\")" "$HEALTH_RESP" 2>/dev/null || echo "")
+        PG_STATUS=$($PYTHON_CMD -c "
+import json, sys
+pg = json.loads(sys.argv[1]).get('postgres') or {}
+status = pg.get('status', '?')
+print(f'pg:{status}' + (f' ({pg[\"error\"]})' if status != 'ok' and pg.get('error') else ''))
+" "$HEALTH_RESP" 2>/dev/null || echo "")
         if [ -n "$PG_STATUS" ]; then
             info "Health: $PG_STATUS"
         else
             info "$HEALTH_RESP"
         fi
     else
-        warn "Container started but health check failed — check: docker compose -f $COMPOSE_FILE logs"
+        warn "Container started but health check failed — check: docker compose -f $COMPOSE_FILE logs --tail 200"
     fi
 else
     fail "Docker compose failed to start"
-    echo "  Debug: docker compose -f $COMPOSE_FILE logs"
+    echo "  Debug: docker compose -f $COMPOSE_FILE logs --tail 200"
 fi
 echo ""
 
@@ -718,9 +848,8 @@ if [ "$STATUSLINE_SETUP" = "Y" ] || [ "$STATUSLINE_SETUP" = "y" ]; then
     SL_SRC="$PLUGIN_DIR/statusline/statusline.py"
     SL_DST="$JARVIS_HOME/statusline.py"
     if [ -f "$SL_SRC" ]; then
-        cp "$SL_SRC" "$SL_DST"
-        chmod +x "$SL_DST"
-        ok "Statusline installed: $SL_DST"
+        install_managed_file "$SL_SRC" "$SL_DST" "statusline" \
+            || warn "Could not write $SL_DST — copy manually: cp \"$SL_SRC\" \"$SL_DST\""
 
         # Detect Claude config dir and merge statusLine into settings.json
         CLAUDE_CFG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"

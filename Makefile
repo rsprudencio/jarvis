@@ -163,7 +163,7 @@ restart: ## Restart Docker container via compose
 	@echo "Waiting for health check (embedding model warms before readiness)..."
 	@attempt=0; \
 	while [ $$attempt -lt 30 ]; do \
-		if curl -sf http://localhost:8741/health > /dev/null; then \
+		if curl -sf --connect-timeout 1 --max-time 2 http://localhost:8741/health > /dev/null; then \
 			echo "$(GREEN)✓ Container healthy$(NC)"; \
 			exit 0; \
 		fi; \

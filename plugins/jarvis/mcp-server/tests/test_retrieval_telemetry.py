@@ -150,6 +150,8 @@ def test_loop_runs_shadow_job_off_the_event_loop(monkeypatch):
 
     monkeypatch.setattr(telemetry, "process_one_shadow_job", fake_job)
     monkeypatch.setattr(telemetry, "cleanup_expired", lambda: 0)
+    # The janitor now runs on the first iteration; keep it off the real DB.
+    monkeypatch.setattr(telemetry, "requeue_failed_shadow_jobs", lambda: 0)
     monkeypatch.setattr(telemetry, "_config", lambda: {
         "shadow": {"poll_seconds": 0.25, "max_jobs_per_second": 100},
     })
@@ -323,22 +325,53 @@ def test_cleanup_query_exempts_labeled_events():
 
     captured = {}
 
-    def fake_execute_query(sql, params=None, fetch=None):
+    def fake_execute_write(sql, params=None, *, returning=False, conn_timeout=None):
         captured["sql"] = sql
         return {"count": 0}
 
-    original = schema.execute_query
-    schema.execute_query = fake_execute_query
+    original = schema.execute_write
+    schema.execute_write = fake_execute_write
     try:
         cleanup_expired()
     finally:
-        schema.execute_query = original
+        schema.execute_write = original
 
     sql = " ".join(captured["sql"].split())
     assert "DELETE FROM local.retrieval_events" in sql
     assert "NOT EXISTS" in sql
     assert "local.retrieval_feedback" in sql
     assert "local.retrieval_candidate_feedback" in sql
+
+
+def test_cleanup_deletes_in_bounded_batches(monkeypatch):
+    """One unbounded DELETE of a 5.7k-event backlog wrote ~117 MiB of WAL in
+    under a second; each transaction is now capped, and so is each run."""
+    import tools.retrieval_telemetry as telemetry
+    import tools.schema as schema
+
+    monkeypatch.setattr(telemetry, "_CLEANUP_BATCH_SIZE", 3)
+    monkeypatch.setattr(telemetry, "_CLEANUP_MAX_BATCHES", 4)
+    backlog = {"left": 7}
+    calls = []
+
+    def fake_execute_write(sql, params=None, *, returning=False, conn_timeout=None):
+        calls.append(params)
+        assert returning is True
+        assert "LIMIT %s" in sql
+        n = min(params[0], backlog["left"])
+        backlog["left"] -= n
+        return {"count": n}
+
+    monkeypatch.setattr(schema, "execute_write", fake_execute_write)
+    assert telemetry.cleanup_expired() == 7
+    assert calls == [(3,), (3,), (3,)]  # 3 + 3 + 1: the short batch ends it
+
+    backlog["left"] = 100
+    calls.clear()
+    assert telemetry.cleanup_expired() == 12  # capped at 4 batches of 3
+    assert len(calls) == 4
+    assert telemetry._cleanup_backlog_left(12) is True
+    assert telemetry._cleanup_backlog_left(11) is False
 
 
 def test_shadow_claim_query_respects_next_attempt_gate():

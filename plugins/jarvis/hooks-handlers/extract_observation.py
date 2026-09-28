@@ -18,6 +18,8 @@ Pipeline:
 7. Store observations via content_write
 8. Advance the selected source's watermark
 """
+import calendar
+import fcntl
 import json
 import os
 import hashlib
@@ -26,9 +28,10 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
-from hook_http_client import post_json
+from hook_http_client import is_core_degraded, post_json
 from turn_state import complete_stop_turn
 
 # Import anthropic at module level for easier testing (imported conditionally in function)
@@ -47,6 +50,12 @@ WATERMARK_MAX_AGE = 2592000  # 30 days in seconds
 # Stop-hook ingest queue (JSONL, oldest-first replay)
 INGEST_QUEUE_FILE = Path.home() / ".jarvis" / "state" / "auto_extract_ingest_queue.jsonl"
 INGEST_REPLAY_BATCH = 20
+# Oldest payloads are dropped (with a warning) beyond this many entries.
+INGEST_QUEUE_MAX_ENTRIES = 500
+# Per-entry replay backoff after a failed delivery: 30s, doubling to a 30min
+# cap. Without it a long outage was re-probed on every Stop in every session.
+INGEST_BACKOFF_BASE_SECONDS = 30
+INGEST_BACKOFF_MAX_SECONDS = 1800
 
 # Token usage log for cost tracking (debug mode)
 TOKEN_LOG_FILE = Path.home() / ".jarvis" / "debug.auto-extraction.log"
@@ -1269,42 +1278,167 @@ def _write_queue_entries(entries: list[dict]) -> None:
         raise
 
 
-def enqueue_ingest_payload(payload: dict) -> None:
-    """Append one ingest payload to queue JSONL."""
+@contextmanager
+def _queue_lock():
+    """Serialize queue read-modify-write across concurrent Stop hooks."""
     path = _queue_file_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+    with open(lock_path, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+_QUEUE_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _format_queue_time(ts: float) -> str:
+    return time.strftime(_QUEUE_TIME_FORMAT, time.gmtime(ts))
+
+
+def _parse_queue_time(value) -> float | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return float(calendar.timegm(time.strptime(value, _QUEUE_TIME_FORMAT)))
+    except (ValueError, OverflowError):
+        return None
+
+
+def ingest_backoff_seconds(attempts: int) -> int:
+    """Delay before replaying an entry after `attempts` failed deliveries."""
+    if attempts <= 0:
+        return 0
+    return min(
+        INGEST_BACKOFF_BASE_SECONDS * 2 ** min(attempts - 1, 16),
+        INGEST_BACKOFF_MAX_SECONDS,
+    )
+
+
+def _entry_attempts(entry: dict) -> int:
+    return max(0, _safe_int(entry.get("attempts"), 0))
+
+
+def _entry_is_due(entry: dict, now: float) -> bool:
+    """Legacy entries (no schedule) and unparsable schedules are due now."""
+    next_attempt_at = _parse_queue_time(entry.get("next_attempt_at"))
+    return next_attempt_at is None or next_attempt_at <= now
+
+
+def _payload_event_ids(payload: dict) -> set[str]:
+    ids = set()
+    observations = payload.get("observations")
+    for obs in observations if isinstance(observations, list) else []:
+        if isinstance(obs, dict) and obs.get("ingest_event_id"):
+            ids.add(str(obs["ingest_event_id"]))
+    worklog = payload.get("worklog")
+    if isinstance(worklog, dict) and worklog.get("ingest_event_id"):
+        ids.add(str(worklog["ingest_event_id"]))
+    return ids
+
+
+def _payload_key(payload: dict) -> str:
+    """Stable identity of a queued payload: its ingest_event_ids, else its content."""
+    ids = _payload_event_ids(payload)
+    if ids:
+        return "ids:" + "|".join(sorted(ids))
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _payload_already_queued(payload: dict, entries: list[dict]) -> bool:
+    """True when every ingest_event_id of `payload` is already queued."""
+    ids = _payload_event_ids(payload)
+    if not ids:
+        key = _payload_key(payload)
+        return any(_payload_key(entry["payload"]) == key for entry in entries)
+    queued: set[str] = set()
+    for entry in entries:
+        queued |= _payload_event_ids(entry["payload"])
+    return ids <= queued
+
+
+def _cap_queue_entries(entries: list[dict]) -> list[dict]:
+    """Keep the newest INGEST_QUEUE_MAX_ENTRIES entries (queue is oldest-first)."""
+    overflow = len(entries) - INGEST_QUEUE_MAX_ENTRIES
+    if overflow <= 0:
+        return entries
+    print(
+        f"WARNING: ingest queue over {INGEST_QUEUE_MAX_ENTRIES} entries, "
+        f"dropped {overflow} oldest payload(s)",
+        file=sys.stderr,
+    )
+    return entries[overflow:]
+
+
+def enqueue_ingest_payload(
+    payload: dict, attempts: int = 0, last_error: str = ""
+) -> bool:
+    """Queue one ingest payload for replay.
+
+    `attempts` counts deliveries already tried; the first replay waits the
+    matching backoff (none when the payload was never sent). A payload whose
+    ingest_event_ids are all queued already is skipped and False is returned.
+    """
+    now = time.time()
+    attempts = max(0, _safe_int(attempts, 0))
     entry = {
-        "enqueued_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "enqueued_at": _format_queue_time(now),
         "payload": payload,
+        "attempts": attempts,
+        "next_attempt_at": _format_queue_time(now + ingest_backoff_seconds(attempts)),
     }
-    with open(path, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(entry) + "\n")
+    if last_error:
+        entry["last_error"] = str(last_error)[:200]
+    with _queue_lock():
+        entries = _load_queue_entries()
+        if _payload_already_queued(payload, entries):
+            return False
+        entries.append(entry)
+        _write_queue_entries(_cap_queue_entries(entries))
+    return True
 
 
 def replay_ingest_queue(batch_limit: int = INGEST_REPLAY_BATCH) -> tuple[int, bool]:
-    """Replay queued ingestion payloads oldest-first.
+    """Replay due queued ingestion payloads oldest-first.
+
+    Entries whose next_attempt_at is still in the future are skipped, so one
+    failing payload cannot pin the head of the queue. A permanent rejection
+    (HTTP 400/413/422) drops the entry with a warning. Any other failure
+    reschedules the entry with exponential backoff and stops the replay; a
+    request skipped by the core-degraded marker stops it without counting an
+    attempt. Requests go out without holding the queue lock, and outcomes are
+    merged into the current file so concurrent enqueues are kept.
 
     Returns:
         (replayed_count, stopped_on_failure)
     """
-    entries = _load_queue_entries()
+    with _queue_lock():
+        entries = _load_queue_entries()
     if not entries:
         return 0, False
 
+    now = time.time()
     replayed = 0
-    remaining: list[dict] = []
+    attempted = 0
     stopped = False
+    done_keys: set[str] = set()
+    rescheduled: dict[str, dict] = {}
 
-    for idx, entry in enumerate(entries):
-        if replayed >= batch_limit:
-            remaining.extend(entries[idx:])
+    for entry in entries:
+        if attempted >= batch_limit:
             break
-
-        payload = entry.get("payload")
-        if not isinstance(payload, dict):
-            replayed += 1
+        if not _entry_is_due(entry, now):
+            continue
+        payload = entry["payload"]
+        key = _payload_key(payload)
+        if key in done_keys:
             continue
 
+        attempted += 1
         response = post_json(
             "/hook/auto-extract/ingest",
             payload,
@@ -1312,14 +1446,40 @@ def replay_ingest_queue(batch_limit: int = INGEST_REPLAY_BATCH) -> tuple[int, bo
         )
         if response.get("success"):
             replayed += 1
+            done_keys.add(key)
+            continue
+        if response.get("permanent"):
+            print(
+                "WARNING: dropped queued ingest payload rejected by core: "
+                f"{response.get('error', 'unknown')}",
+                file=sys.stderr,
+            )
+            done_keys.add(key)
             continue
 
-        remaining.extend(entries[idx:])
         stopped = True
+        if not response.get("skipped"):
+            attempts = _entry_attempts(entry) + 1
+            rescheduled[key] = {
+                "attempts": attempts,
+                "next_attempt_at": _format_queue_time(
+                    now + ingest_backoff_seconds(attempts)
+                ),
+                "last_error": str(response.get("error", ""))[:200],
+            }
         break
 
-    if replayed > 0 or (entries and not stopped):
-        _write_queue_entries(remaining)
+    if done_keys or rescheduled:
+        with _queue_lock():
+            kept = []
+            for current in _load_queue_entries():
+                key = _payload_key(current["payload"])
+                if key in done_keys:
+                    continue
+                if key in rescheduled:
+                    current = {**current, **rescheduled[key]}
+                kept.append(current)
+            _write_queue_entries(kept)
     return replayed, stopped
 
 
@@ -1702,12 +1862,18 @@ def main():
     git_branch = sys.argv[5] if len(sys.argv) >= 6 else ""
     hook_input = os.environ.get("JARVIS_HOOK_INPUT", "")
 
-    # Replay queued payloads first (oldest-first, bounded batch).
-    replayed, replay_stopped = replay_ingest_queue()
-    if replayed:
-        print(f"Replayed {replayed} queued ingest payload(s)", file=sys.stderr)
-    if replay_stopped:
-        print("Queue replay stopped on first ingest failure", file=sys.stderr)
+    # Replay due queued payloads first (oldest-first, bounded batch), unless a
+    # hook in any session saw core fail within the last minute. The HTTP
+    # client then skips the context and ingest requests too, so the new
+    # payload is queued without touching the network.
+    if is_core_degraded():
+        print("Core recently unavailable, skipping queue replay", file=sys.stderr)
+    else:
+        replayed, replay_stopped = replay_ingest_queue()
+        if replayed:
+            print(f"Replayed {replayed} queued ingest payload(s)", file=sys.stderr)
+        if replay_stopped:
+            print("Queue replay stopped on first ingest failure", file=sys.stderr)
 
     # Load extraction/worklog config and known workstreams via HTTP endpoint.
     ctx_response = post_json(
@@ -1925,11 +2091,27 @@ def main():
         timeout_seconds=2.5,
     )
     if not ingest_response.get("success"):
-        enqueue_ingest_payload(ingest_payload)
-        print(
-            f"Ingest unavailable, queued payload for replay: {ingest_response.get('error', 'unknown')}",
-            file=sys.stderr,
-        )
+        ingest_error = ingest_response.get("error", "unknown")
+        if ingest_response.get("permanent"):
+            # Queuing a payload core rejects would only fail again on replay.
+            print(
+                f"WARNING: ingest rejected payload, dropped: {ingest_error}",
+                file=sys.stderr,
+            )
+        else:
+            # A request skipped by the core-degraded marker was never sent,
+            # so it does not count as a delivery attempt.
+            queued = enqueue_ingest_payload(
+                ingest_payload,
+                attempts=0 if ingest_response.get("skipped") else 1,
+                last_error=ingest_error,
+            )
+            print(
+                "Ingest unavailable, "
+                + ("queued payload for replay" if queued else "payload already queued")
+                + f": {ingest_error}",
+                file=sys.stderr,
+            )
         _log_extraction(
             backend,
             input_tokens,

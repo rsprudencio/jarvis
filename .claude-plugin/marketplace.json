@@ -13,7 +13,7 @@
     {
       "name": "jarvis",
       "source": "./plugins/jarvis",
-      "version": "3.6.0",
+      "version": "3.7.0",
       "description": "Core Jarvis - vault management, semantic memory, auto-extract (REQUIRED for extensions)"
     },
     {
@@ -37,7 +37,7 @@
     {
       "name": "jarvis-obsidian",
       "source": "./plugins/jarvis-obsidian",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "description": "Obsidian vault PKM workflows - JARVIS protocol, git audit trail, journal, exploration (requires: jarvis)"
     }
   ]

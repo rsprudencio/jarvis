@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from typing import TYPE_CHECKING
 
@@ -30,6 +31,8 @@ logger = logging.getLogger(__name__)
 # Singleton state
 _service: EmbeddingService | None = None
 _service_cache_key: tuple | None = None
+# Hooks and MCP tools call in from worker threads: one service per config.
+_service_lock = threading.Lock()
 
 
 class EmbeddingService:
@@ -82,6 +85,11 @@ class EmbeddingService:
         self._ort_session = None
         self._tokenizer = None
         self._onnx_call_count = 0
+        # Hooks and MCP tools encode from worker threads. The periodic reset
+        # sets _ort_session/_tokenizer to None under any concurrent encode,
+        # and HF fast tokenizers are not safe to share across threads either,
+        # so local-model loading, reset and inference run one at a time.
+        self._local_lock = threading.RLock()
         # Sentence-transformers fallback
         self._model: SentenceTransformer | None = None
         # Bedrock client (lazy-initialized)
@@ -173,6 +181,10 @@ class EmbeddingService:
 
     def _load_onnx(self):
         """Load ONNX Runtime session + tokenizer directly."""
+        with self._local_lock:
+            self._load_onnx_locked()
+
+    def _load_onnx_locked(self):
         if self._ort_session is not None:
             return
 
@@ -211,6 +223,10 @@ class EmbeddingService:
         cleanup (multiple gc passes) because ONNX C++ objects may hold
         indirect references that require multiple collection cycles.
         """
+        with self._local_lock:
+            self._reset_onnx_session_locked()
+
+    def _reset_onnx_session_locked(self) -> None:
         if self._ort_session is not None:
             import gc
             count = self._onnx_call_count
@@ -233,6 +249,10 @@ class EmbeddingService:
         4. Otherwise, apply attention-masked mean pooling
         5. L2-normalize
         """
+        with self._local_lock:
+            return self._onnx_encode_locked(texts, normalize)
+
+    def _onnx_encode_locked(self, texts: list[str], normalize: bool) -> np.ndarray:
         # Periodic session reset to prevent C++ heap fragmentation
         self._onnx_call_count += 1
         if self._onnx_call_count >= self._ONNX_RESET_INTERVAL:
@@ -275,21 +295,22 @@ class EmbeddingService:
 
     def _load_model(self) -> SentenceTransformer:
         """Lazy-load the sentence-transformers model (PyTorch fallback)."""
-        if self._model is not None:
+        with self._local_lock:
+            if self._model is not None:
+                return self._model
+
+            from sentence_transformers import SentenceTransformer
+
+            self._model = SentenceTransformer(
+                model_name_or_path=self._model_name,
+                device=self._device,
+            )
+            logger.info(
+                "Loaded %s with PyTorch backend on %s",
+                self._model_name,
+                self._device,
+            )
             return self._model
-
-        from sentence_transformers import SentenceTransformer
-
-        self._model = SentenceTransformer(
-            model_name_or_path=self._model_name,
-            device=self._device,
-        )
-        logger.info(
-            "Loaded %s with PyTorch backend on %s",
-            self._model_name,
-            self._device,
-        )
-        return self._model
 
     # ── Public API ──────────────────────────────────────────────────
 
@@ -459,9 +480,19 @@ def get_embedding_service() -> EmbeddingService:
         cfg.get("host_url"), cfg.get("host_token"), cfg.get("host_timeout_ms"),
     )
 
-    if _service is not None and _service_cache_key == key:
+    service = _service
+    if service is not None and _service_cache_key == key:
+        return service
+
+    with _service_lock:
+        if _service is not None and _service_cache_key == key:
+            return _service
+        _service = EmbeddingService(**_service_kwargs(cfg, effective_model))
+        _service_cache_key = key
         return _service
 
+
+def _service_kwargs(cfg: dict, effective_model: str) -> dict:
     kwargs = {
         "model_name": effective_model,
         "dimensions": cfg["dimensions"],
@@ -476,10 +507,7 @@ def get_embedding_service() -> EmbeddingService:
             host_token=cfg.get("host_token", ""),
             host_timeout_ms=cfg.get("host_timeout_ms", 2000),
         )
-
-    _service = EmbeddingService(**kwargs)
-    _service_cache_key = key
-    return _service
+    return kwargs
 
 
 def warm_embedding_service() -> float | None:

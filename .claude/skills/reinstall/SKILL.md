@@ -102,6 +102,40 @@ echo "Active cache directory: $DETECTED_DIR/plugins/cache/jarvis-plugins/"
 ls -la "$DETECTED_DIR/plugins/cache/jarvis-plugins/"
 ```
 
+### Step 3b: Refresh the Host-Side Copies (launcher + statusline)
+
+The plugin reinstall never touches files `install.sh` copied onto the host: the
+`jarvis` launcher (`plugins/jarvis/shell/jarvis.sh`) and `~/.jarvis/statusline.py`
+(`plugins/jarvis/statusline/statusline.py`). Stale copies keep old behavior (e.g.
+an unbounded health probe that hangs the launcher during a DB outage). Re-copy
+them when they differ, keeping a private backup. Symlinks (dev setups) are left
+alone. Run from the repo root:
+
+```bash
+JARVIS_HOME="${JARVIS_HOME:-$HOME/.jarvis}"
+refresh_copy() {  # refresh_copy <src> <installed copy>
+  local src="$1" dst="$2" bdir="$JARVIS_HOME/backups/installed" backup tmp
+  if [ ! -f "$dst" ] || [ -L "$dst" ]; then echo "skip: $dst (absent or symlink)"; return 0; fi
+  if cmp -s "$src" "$dst"; then echo "up to date: $dst"; return 0; fi
+  mkdir -p "$bdir" && chmod 700 "$JARVIS_HOME/backups" "$bdir" || return 1
+  backup="$bdir/$(basename "$dst").$(date +%Y%m%d-%H%M%S).bak"
+  cp "$dst" "$backup" && chmod 600 "$backup" || return 1
+  tmp="$dst.tmp.$$"
+  if cp "$src" "$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$dst"; then
+    echo "refreshed: $dst (previous copy: $backup)"
+  else
+    rm -f "$tmp"; return 1
+  fi
+}
+launcher=$(command -v jarvis 2>/dev/null)
+if [ -n "$launcher" ] && grep -q "Jarvis AI Assistant launcher" "$launcher" 2>/dev/null; then
+  refresh_copy plugins/jarvis/shell/jarvis.sh "$launcher"
+fi
+refresh_copy plugins/jarvis/statusline/statusline.py "$JARVIS_HOME/statusline.py"
+```
+
+Re-running `install.sh` does the same (it refreshes both copies on every run).
+
 ### Step 4: Remind User to Restart
 
 **IMPORTANT:** Plugin changes only take effect after a full restart of Claude Code, not just a reload.

@@ -16,7 +16,10 @@ from typing import Optional
 
 import numpy as np
 
-from .schema import execute_query, jsonb_to_metadata, metadata_to_jsonb
+from .schema import (
+    DatabaseUnavailable, execute_query, is_db_unavailable_error,
+    jsonb_to_metadata, metadata_to_jsonb, safe_db_error,
+)
 from .paths import get_path, SENSITIVE_PATHS
 from .namespaces import parse_id, ALL_TYPES, schema_for_id, SCHEMA_LOCAL, SCHEMA_OBSIDIAN
 from .expansion import expand_query as _expand_query
@@ -1066,6 +1069,11 @@ def _cross_schema_search(query_embedding, fetch_count: int,
             else:
                 continue
             rows.extend(schema_rows)
+        except DatabaseUnavailable:
+            # Every schema shares the one pool: when it cannot hand out a
+            # connection, skipping would just repeat the wait per schema and
+            # disguise an outage as "no results".
+            raise
         except Exception as e:
             import logging as _logging
             _logging.getLogger("jarvis-core").error(
@@ -1177,6 +1185,7 @@ def query_vault(
     purpose: str = "explicit_recall",
     telemetry_user_facing: bool = True,
     telemetry_query_ref: Optional[str] = None,
+    rerank: bool = True,
 ) -> dict:
     """Semantic search across vault memory.
 
@@ -1188,6 +1197,8 @@ def query_vault(
         n_results: Max results (capped at 20)
         filter: Optional metadata filters (directory, type, importance, tags)
         user: Optional user filter for multi-user isolation
+        rerank: False skips cross-encoder reranking even when it is enabled
+            (callers that only need raw similarity, e.g. dedup, on a deadline)
 
     Returns:
         Formatted results dict with titles, paths, excerpts, relevance scores
@@ -1209,6 +1220,11 @@ def query_vault(
             vault_count["cnt"] if vault_count else 0
         )
     except Exception as e:
+        if is_db_unavailable_error(e):
+            # Structured, so callers (hook ingest dedup) can tell "retry
+            # later" from "no match" without parsing the message.
+            return {"success": False, "error": f"Database unavailable: {safe_db_error(e)}",
+                    "retryable": True}
         return {"success": False, "error": f"Database unavailable: {e}"}
 
     # D4: Add remote schema counts (best-effort — failures don't abort the query)
@@ -1245,6 +1261,8 @@ def query_vault(
     # a multi-chunk document can crowd out others — overfetch_factor (default 5)
     # sizes the window to survive dedup.
     reranking_config = get_reranking_config()
+    if not rerank:
+        reranking_config = {**reranking_config, "enabled": False}
     if reranking_config.get("enabled", False):
         # candidate_count caps how many POST-dedup survivors reach the
         # reranker (below); it must not shrink this pre-dedup ANN window or
@@ -1270,6 +1288,10 @@ def query_vault(
         # D8: Unknown schema names in the filter
         return {"success": False, "error": str(e)}
     except Exception as e:
+        if is_db_unavailable_error(e):
+            # No error trace: writing it needs the database that just failed.
+            return {"success": False, "error": f"Database unavailable: {safe_db_error(e)}",
+                    "retryable": True}
         trace_id = _record_empty_trace(
             purpose, query, outcome="error", error=str(e), user_name=user,
             user_facing=telemetry_user_facing, query_ref=telemetry_query_ref,
@@ -1700,8 +1722,11 @@ def semantic_context(
         total = (core_count["cnt"] if core_count else 0) + (
             vault_count["cnt"] if vault_count else 0
         )
-    except Exception:
-        return {"matches": [], "query_ms": 0, "total_searched": 0}
+    except Exception as exc:
+        response = {"matches": [], "query_ms": 0, "total_searched": 0}
+        if is_db_unavailable_error(exc):
+            response.update(degraded=True, error=safe_db_error(exc))
+        return response
 
     # D4: Add remote schema counts (best-effort)
     from .schema_registry import get_searchable_schemas as _gss, SchemaKind as _SK, is_valid_pg_identifier as _vpi
@@ -1731,6 +1756,10 @@ def semantic_context(
         )
     except Exception as exc:
         response = {"matches": [], "query_ms": 0, "total_searched": total}
+        if is_db_unavailable_error(exc):
+            # No error trace: writing it needs the database that just failed.
+            response.update(degraded=True, error=safe_db_error(exc))
+            return response
         trace_id = _record_empty_trace(
             "context_injection", query, outcome="error", error=str(exc)
         )

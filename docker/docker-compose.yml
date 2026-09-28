@@ -2,6 +2,13 @@
 #
 # Embedded PostgreSQL is the default for personal use.
 # Set POSTGRES_URL to point at an external database (team/managed deployments).
+#
+# Embedded PostgreSQL data lives in the named `pgdata` volume. Earlier versions
+# of this file kept it in the container's writable layer: if you ran those,
+# take a dump BEFORE the first `up -d` with this file (the config change
+# recreates the container, discarding that layer):
+#   docker compose -f docker/docker-compose.yml exec -T jarvis \
+#     su postgres -c 'pg_dump -h 127.0.0.1 -Fc jarvis' > jarvis.dump
 
 services:
   jarvis:
@@ -9,14 +16,18 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    # MCP ports are loopback-only by default: with server.auth disabled anyone
+    # who can reach them can read and write memories. Set JARVIS_BIND_HOST=0.0.0.0
+    # only with server.auth.enabled=true in config.json.
     ports:
-      - "${JARVIS_CORE_PORT:-8741}:8741"
-      - "${JARVIS_TODOIST_PORT:-8742}:8742"
-      - "${JARVIS_OBSIDIAN_PORT:-8744}:8744"
+      - "${JARVIS_BIND_HOST:-127.0.0.1}:${JARVIS_CORE_PORT:-8741}:8741"
+      - "${JARVIS_BIND_HOST:-127.0.0.1}:${JARVIS_TODOIST_PORT:-8742}:8742"
+      - "${JARVIS_BIND_HOST:-127.0.0.1}:${JARVIS_OBSIDIAN_PORT:-8744}:8744"
       - "127.0.0.1:${JARVIS_EXPLORER_PORT:-8750}:8750"
     volumes:
       - "${JARVIS_VAULT_PATH:?Set JARVIS_VAULT_PATH to your Obsidian vault}:/vault"
       - "${JARVIS_HOME:-~/.jarvis}:/config"
+      - pgdata:/var/lib/postgresql/data
     extra_hosts:
       # No-op on Docker Desktop (macOS); required for host.docker.internal
       # to resolve on Linux engines.
@@ -56,9 +67,19 @@ services:
       - AURORA_PASSWORD=${AURORA_PASSWORD:-}
     stop_grace_period: 30s
     restart: unless-stopped
+    # Bounded, rotated container logs (the default json-file log grows without
+    # limit on the same VM disk as the database volume).
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "5"
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8741/health"]
       interval: 30s
       timeout: 5s
       start_period: 30s
       retries: 3
+
+volumes:
+  pgdata:

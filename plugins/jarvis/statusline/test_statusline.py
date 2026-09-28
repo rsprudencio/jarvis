@@ -207,19 +207,19 @@ class TestJarvisHealth:
         with mock.patch.object(sl, "CACHE_DIR", tmp_path):
             mock_run.return_value = mock.Mock(
                 returncode=0,
-                stdout='{"status":"ok","server":"jarvis-core","version":"2.3.0","postgres":{"status":"ok","doc_count":2657}}',
+                stdout='{"status":"ok","server":"jarvis-core","version":"3.6.0","postgres":{"status":"ok","error":null,"checked_at":1790000000.0,"free_bytes":107374182400}}',
             )
             result = sl._jarvis_health()
             assert result["ok"] is True
             assert result["pg_status"] == "ok"
-            assert result["doc_count"] == 2657
+            assert result["pg_free_bytes"] == 107374182400
 
     @mock.patch("statusline.subprocess.run")
     def test_healthy_with_replication(self, mock_run, tmp_path):
         with mock.patch.object(sl, "CACHE_DIR", tmp_path):
             mock_run.return_value = mock.Mock(
                 returncode=0,
-                stdout='{"status":"ok","postgres":{"status":"ok","doc_count":100},"replication":{"mode":"local"}}',
+                stdout='{"status":"ok","postgres":{"status":"ok","error":null,"checked_at":1.0,"free_bytes":null},"replication":{"mode":"local"}}',
             )
             result = sl._jarvis_health()
             assert result["ok"] is True
@@ -232,7 +232,7 @@ class TestJarvisHealth:
             result = sl._jarvis_health()
             assert result["ok"] is False
             assert result["pg_status"] == ""
-            assert result["doc_count"] == 0
+            assert result["pg_free_bytes"] is None
 
     @mock.patch("statusline.subprocess.run", side_effect=FileNotFoundError)
     def test_no_curl(self, mock_run, tmp_path):
@@ -242,23 +242,24 @@ class TestJarvisHealth:
 
     def test_uses_cache(self, tmp_path):
         with mock.patch.object(sl, "CACHE_DIR", tmp_path):
-            sl._write_cache("jarvis.json", {"ok": True, "pg_status": "ok", "doc_count": 42, "repl_mode": ""})
+            sl._write_cache("jarvis.json", {"ok": True, "pg_status": "recovering", "pg_free_bytes": 42, "repl_mode": ""})
             result = sl._jarvis_health()
             assert result["ok"] is True
-            assert result["doc_count"] == 42
+            assert result["pg_status"] == "recovering"
+            assert result["pg_free_bytes"] == 42
 
     @mock.patch("statusline.subprocess.run")
     def test_caches_result(self, mock_run, tmp_path):
         with mock.patch.object(sl, "CACHE_DIR", tmp_path):
             mock_run.return_value = mock.Mock(
                 returncode=0,
-                stdout='{"status":"ok","postgres":{"status":"ok","doc_count":10}}',
+                stdout='{"status":"ok","postgres":{"status":"disk_full","error":"No space left on device","checked_at":1.0,"free_bytes":10}}',
             )
             sl._jarvis_health()
             cached = sl._read_cache("jarvis.json", 60)
             assert cached["ok"] is True
-            assert cached["pg_status"] == "ok"
-            assert cached["doc_count"] == 10
+            assert cached["pg_status"] == "disk_full"
+            assert cached["pg_free_bytes"] == 10
 
     @mock.patch("statusline.subprocess.run")
     def test_degraded_pg(self, mock_run, tmp_path):
@@ -277,7 +278,7 @@ class TestJarvisHealth:
 # ---------------------------------------------------------------------------
 
 class TestGenerate:
-    @mock.patch.object(sl, "_jarvis_health", return_value={"ok": True, "pg_status": "ok", "doc_count": 2657, "repl_mode": ""})
+    @mock.patch.object(sl, "_jarvis_health", return_value={"ok": True, "pg_status": "ok", "pg_free_bytes": None, "repl_mode": ""})
     @mock.patch.object(sl, "_git_info", return_value={"branch": "main", "dirty": False})
     @mock.patch.object(sl, "_account_name", return_value="personal-account")
     def test_full_output(self, mock_acct, mock_git, mock_jarvis, tmp_path):
@@ -293,7 +294,8 @@ class TestGenerate:
             assert "\n" not in output
             assert "personal-account" in output
             assert "JARVIS" in output
-            assert "pg:ok(2657)" in output
+            # A healthy database adds no segment
+            assert "DB:" not in output
             assert "my-session" in output
             assert "Opus 4.6" in output
             assert "project" in output
@@ -301,7 +303,7 @@ class TestGenerate:
             assert "$0.5000" in output
             assert "45%" in output
 
-    @mock.patch.object(sl, "_jarvis_health", return_value={"ok": True, "pg_status": "ok", "doc_count": 100, "repl_mode": "local"})
+    @mock.patch.object(sl, "_jarvis_health", return_value={"ok": True, "pg_status": "ok", "pg_free_bytes": None, "repl_mode": "local"})
     @mock.patch.object(sl, "_git_info", return_value={"branch": "main", "dirty": False})
     @mock.patch.object(sl, "_account_name", return_value="")
     def test_replication_indicator(self, mock_acct, mock_git, mock_jarvis, tmp_path):
@@ -309,18 +311,19 @@ class TestGenerate:
             data = {"model": "test", "cwd": "/tmp", "context_window": {}}
             output = sl.generate(data)
             assert "repl:local" in output
-            assert "pg:ok(100)" in output
+            assert "DB:" not in output
 
-    @mock.patch.object(sl, "_jarvis_health", return_value={"ok": True, "pg_status": "disconnected", "doc_count": 0, "repl_mode": ""})
+    @mock.patch.object(sl, "_jarvis_health", return_value={"ok": True, "pg_status": "disconnected", "pg_free_bytes": None, "repl_mode": ""})
     @mock.patch.object(sl, "_git_info", return_value={"branch": "", "dirty": False})
     @mock.patch.object(sl, "_account_name", return_value="")
     def test_pg_disconnected_display(self, mock_acct, mock_git, mock_jarvis, tmp_path):
         with mock.patch.object(sl, "CACHE_DIR", tmp_path):
             data = {"model": "test", "cwd": "/tmp", "context_window": {}}
             output = sl.generate(data)
-            assert "pg:disconnected" in output
+            assert "DB: disconnected" in output
+            assert sl.RED in output
 
-    @mock.patch.object(sl, "_jarvis_health", return_value={"ok": False, "pg_status": "", "doc_count": 0, "repl_mode": ""})
+    @mock.patch.object(sl, "_jarvis_health", return_value={"ok": False, "pg_status": "", "pg_free_bytes": None, "repl_mode": ""})
     @mock.patch.object(sl, "_git_info", return_value={"branch": "", "dirty": False})
     @mock.patch.object(sl, "_account_name", return_value="")
     def test_minimal_data(self, mock_acct, mock_git, mock_jarvis, tmp_path):
@@ -430,6 +433,134 @@ class TestFolderEmoji:
             output = sl.generate({"model": "test", "cwd": "/Users/test/my-project"})
             assert "\U0001f4c1" in output
             assert "my-project" in output
+
+
+# ---------------------------------------------------------------------------
+# /health postgres object rendering (cached server-side DB probe)
+# ---------------------------------------------------------------------------
+
+def _health_json(pg_status, free_bytes=None, top_status="ok"):
+    return json.dumps({
+        "status": top_status,
+        "server": "jarvis-core",
+        "version": "3.6.0",
+        "postgres": {
+            "status": pg_status,
+            "error": None if pg_status == "ok" else "the database system is in recovery mode",
+            "checked_at": 1790000000.0,
+            "free_bytes": free_bytes,
+        },
+    })
+
+
+def _render_with_health(tmp_path, stdout, returncode=0):
+    """Run generate() with curl mocked to return `stdout` for /health."""
+    with mock.patch.object(sl, "CACHE_DIR", tmp_path), \
+         mock.patch.object(sl, "_git_info", return_value={"branch": "", "dirty": False}), \
+         mock.patch.object(sl, "_account_name", return_value=""), \
+         mock.patch("statusline.subprocess.run",
+                    return_value=mock.Mock(returncode=returncode, stdout=stdout)):
+        return sl.generate({"model": "test", "cwd": "/tmp/x"})
+
+
+class TestPostgresStatus:
+    @pytest.mark.parametrize("pg_status,label,color", [
+        ("recovering", "DB: recovering", sl.RED),
+        ("unreachable", "DB: unreachable", sl.RED),
+        ("disk_full", "DB: disk full", sl.RED),
+        ("unknown", "DB: unknown", sl.YELLOW),
+    ])
+    def test_not_ok_status_renders_segment(self, pg_status, label, color, tmp_path):
+        output = _render_with_health(tmp_path, _health_json(pg_status))
+        assert "JARVIS" in output
+        assert f"{color}{label}" in output
+
+    def test_ok_status_renders_no_segment(self, tmp_path):
+        output = _render_with_health(tmp_path, _health_json("ok", 10 ** 11))
+        assert "JARVIS" in output
+        assert "DB:" not in output
+
+    def test_disk_full_shows_free_space(self, tmp_path):
+        output = _render_with_health(tmp_path, _health_json("disk_full", 12 * 1024 * 1024))
+        assert "DB: disk full (12M free)" in output
+
+    def test_free_space_only_shown_for_disk_full(self, tmp_path):
+        output = _render_with_health(tmp_path, _health_json("recovering", 12 * 1024 * 1024))
+        assert "DB: recovering" in output
+        assert "free" not in output
+
+    def test_top_level_ok_gate_still_applies(self, tmp_path):
+        """A non-ok top-level status hides branding and the DB segment."""
+        output = _render_with_health(tmp_path, _health_json("recovering", top_status="starting"))
+        assert "JARVIS" not in output
+        assert "DB:" not in output
+
+    def test_health_without_postgres_key(self, tmp_path):
+        """Older servers without the postgres object still render JARVIS."""
+        output = _render_with_health(tmp_path, '{"status":"ok","server":"jarvis-core"}')
+        assert "JARVIS" in output
+        assert "DB:" not in output
+
+    @pytest.mark.parametrize("pg_value", ["null", '"recovering"', "[1, 2]", "42"])
+    def test_malformed_postgres_value_ignored(self, pg_value, tmp_path):
+        output = _render_with_health(tmp_path, '{"status":"ok","postgres":%s}' % pg_value)
+        assert "JARVIS" in output
+        assert "DB:" not in output
+        assert "statusline error" not in output
+
+    def test_non_object_health_body(self, tmp_path):
+        with mock.patch.object(sl, "CACHE_DIR", tmp_path), \
+             mock.patch("statusline.subprocess.run",
+                        return_value=mock.Mock(returncode=0, stdout="[1, 2, 3]")):
+            result = sl._jarvis_health()
+        assert result["ok"] is False
+
+    def test_unrecognized_status_is_sanitized(self, tmp_path):
+        """Server text never reaches the terminal raw (no escape injection)."""
+        hostile = "\x1b[2J\x1b]0;owned\x07Bad Status!"
+        output = _render_with_health(tmp_path, _health_json(hostile))
+        assert "\x1b[2J" not in output
+        assert "\x07" not in output
+        assert "]0;owned" not in output
+        assert f"{sl.RED}DB: 2j0ownedbadstatus" in output
+
+    def test_error_text_not_rendered(self, tmp_path):
+        output = _render_with_health(tmp_path, _health_json("recovering"))
+        assert "recovery mode" not in output
+
+    def test_curl_timeout_drops_branding(self, tmp_path):
+        with mock.patch.object(sl, "CACHE_DIR", tmp_path), \
+             mock.patch("statusline.subprocess.run",
+                        side_effect=subprocess.TimeoutExpired("curl", 3)):
+            result = sl._jarvis_health()
+        assert result["ok"] is False
+        assert result["pg_status"] == ""
+
+    def test_probe_is_time_bounded(self, tmp_path):
+        with mock.patch.object(sl, "CACHE_DIR", tmp_path), \
+             mock.patch("statusline.subprocess.run",
+                        return_value=mock.Mock(returncode=0, stdout=_health_json("ok"))) as run:
+            sl._jarvis_health()
+        args, kwargs = run.call_args
+        assert "--max-time" in args[0]
+        assert kwargs["timeout"] <= 3
+
+
+class TestFmtBytes:
+    @pytest.mark.parametrize("value,expected", [
+        (0, "0B"),
+        (512, "512B"),
+        (1536, "1.5K"),
+        (12 * 1024 * 1024, "12M"),
+        (int(2.5 * 1024 ** 3), "2.5G"),
+        (5 * 1024 ** 5, "5120T"),
+    ])
+    def test_units(self, value, expected):
+        assert sl._fmt_bytes(value) == expected
+
+    @pytest.mark.parametrize("value", [None, -1, "12", 1.5, True])
+    def test_invalid(self, value):
+        assert sl._fmt_bytes(value) == ""
 
 
 # ---------------------------------------------------------------------------

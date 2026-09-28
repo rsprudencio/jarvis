@@ -3,6 +3,12 @@
 These are intentionally thin wrappers around existing tool internals so the
 hook scripts can call stable local HTTP endpoints without importing tools.*
 directly.
+
+Outage contract: every DB checkout here is bounded by HOOK_CONN_TIMEOUT. While
+PostgreSQL is known-down (circuit breaker open) the context endpoints answer
+immediately with their empty shape plus ``degraded: True``, and ingest answers
+``success: False, retryable: True`` so the hook client keeps the payload queued
+instead of treating a partial failure as delivered.
 """
 
 from __future__ import annotations
@@ -18,6 +24,13 @@ from .config import (
 )
 from .query import query_vault, semantic_context, _parse_schemas
 from .content import content_list, content_write
+from .schema import (
+    HOOK_CONN_TIMEOUT,
+    DatabaseUnavailable,
+    checkout_timeout,
+    db_available,
+    db_unavailable_reason,
+)
 
 _DEDUP_JACCARD_THRESHOLD = 0.5
 _DEDUP_RELEVANCE_THRESHOLD = 0.95
@@ -65,8 +78,54 @@ def _jaccard_similarity(text_a: str, text_b: str) -> float:
     return len(intersection) / len(union) if union else 0.0
 
 
+def _strip_db_prefix(error: Any) -> str:
+    """Drop a leading "Database unavailable:" so re-wrapping doesn't stutter."""
+    text = _safe_str(error)
+    prefix = "database unavailable:"
+    if text.lower().startswith(prefix):
+        text = text[len(prefix):].strip()
+    return text or "PostgreSQL is unreachable"
+
+
+def _db_unavailable_error(reason: Any) -> str:
+    return f"database unavailable: {_strip_db_prefix(reason)}"
+
+
+def _retryable_failure(error: str, observations: list | None = None) -> dict:
+    """Ingest could not finish for a transient reason: the caller must retry.
+
+    Observations handled before the failure are included for debugging.
+    Replaying the whole payload is safe: content_write deduplicates by
+    ingest_event_id and observation dedup matches anything already stored.
+    """
+    return {
+        "success": False,
+        "retryable": True,
+        "error": error,
+        "observations": observations or [],
+        "worklog": None,
+    }
+
+
+def _transient_write_error(write_result: dict) -> str | None:
+    """Client-facing error when a write failed for a retryable reason."""
+    if not write_result.get("retryable"):
+        return None
+    if write_result.get("error_kind") == "model_host_unavailable":
+        return f"embedding service unavailable: {_safe_str(write_result.get('error'))}"
+    return _db_unavailable_error(write_result.get("error"))
+
+
 def _is_duplicate_observation(content: str, threshold: float) -> bool:
-    """Embedding-similarity dedup for observations."""
+    """Embedding-similarity dedup for observations.
+
+    Raises DatabaseUnavailable when the lookup failed because PostgreSQL is
+    down: "unknown" must not be read as "not a duplicate" and written anyway.
+
+    No cross-encoder reranking: the gate below reads raw cosine similarity,
+    and a host rerank (up to host_timeout_ms, 1.5s) per observation pushed
+    healthy ingests past the 2s hook deadline.
+    """
     result = query_vault(
         query=content,
         n_results=5,
@@ -74,7 +133,10 @@ def _is_duplicate_observation(content: str, threshold: float) -> bool:
         purpose="duplicate_detection",
         telemetry_user_facing=False,
         telemetry_query_ref="auto_extract_candidate",
+        rerank=False,
     )
+    if not result.get("success") and result.get("retryable"):
+        raise DatabaseUnavailable(_strip_db_prefix(result.get("error")))
     if not result.get("success") or not result.get("results"):
         return False
 
@@ -106,6 +168,8 @@ def _is_duplicate_worklog(task_summary: str, session_id: str, threshold: float) 
         limit=20,
         sort_by="created_at_desc",
     )
+    if not result.get("success") and result.get("retryable"):
+        raise DatabaseUnavailable(_strip_db_prefix(result.get("error")))
     if not result.get("success") or not result.get("documents"):
         return False
 
@@ -124,6 +188,8 @@ def _extract_workstreams(limit: int) -> list[str]:
         sort_by="created_at_desc",
         include_content=False,
     )
+    if not result.get("success") and result.get("retryable"):
+        raise DatabaseUnavailable(_strip_db_prefix(result.get("error")))
     if not result.get("success") or not result.get("documents"):
         return []
 
@@ -205,16 +271,29 @@ def get_prompt_context(prompt: str) -> dict:
     if not enabled or not _safe_str(prompt):
         return result
 
+    # PostgreSQL known-down: answer now. An empty injection is the degradation
+    # the hook already handles; waiting on the pool is not.
+    if not db_available():
+        result.update(degraded=True, error=_db_unavailable_error(db_unavailable_reason()))
+        return result
+
     # Default to all schemas for session injection (local + obsidian + discovered remotes).
     schemas_str = config.get("schemas", "all")
-    search = semantic_context(
-        query=prompt,
-        threshold=threshold,
-        budget=budget,
-        skip_retrieval_increment=False,
-        schemas=_parse_schemas(schemas_str),
-        max_results=max_results,
-    )
+    with checkout_timeout(HOOK_CONN_TIMEOUT):
+        search = semantic_context(
+            query=prompt,
+            threshold=threshold,
+            budget=budget,
+            skip_retrieval_increment=False,
+            schemas=_parse_schemas(schemas_str),
+            max_results=max_results,
+        )
+    # Degraded only when nothing usable came back: matches found before a
+    # late failure (retrieval-count bump, telemetry) are still worth injecting.
+    if search.get("degraded") or (not search.get("matches") and not db_available()):
+        reason = search.get("error") or db_unavailable_reason()
+        result.update(degraded=True, error=_db_unavailable_error(reason))
+        return result
     result.update(
         {
             "matches": search.get("matches", []),
@@ -240,10 +319,18 @@ def get_auto_extract_context(workstream_limit: int = 30) -> dict:
     limit = max(1, min(200, _safe_int(workstream_limit, 30)))
 
     known_workstreams = []
+    degraded_error = None
     if bool(worklog.get("enabled", True)):
-        known_workstreams = _extract_workstreams(limit)
+        if not db_available():
+            degraded_error = _db_unavailable_error(db_unavailable_reason())
+        else:
+            try:
+                with checkout_timeout(HOOK_CONN_TIMEOUT):
+                    known_workstreams = _extract_workstreams(limit)
+            except DatabaseUnavailable as exc:
+                degraded_error = _db_unavailable_error(exc)
 
-    return {
+    response = {
         "success": True,
         "auto_extract": {
             "mode": auto_extract.get("mode", "background"),
@@ -265,10 +352,27 @@ def get_auto_extract_context(workstream_limit: int = 30) -> dict:
         },
         "known_workstreams": known_workstreams,
     }
+    if degraded_error:
+        response.update(degraded=True, error=degraded_error)
+    return response
 
 
 def ingest_auto_extract(payload: dict) -> dict:
-    """Persist extracted observations/worklog with dedup checks."""
+    """Persist extracted observations/worklog with dedup checks.
+
+    Returns ``success: False, retryable: True`` as soon as a write or dedup
+    lookup fails because PostgreSQL (or the model host) is unavailable, and
+    makes no further attempts. ``success: True`` with per-item ``error``
+    entries is reserved for permanent failures (validation, secret scan).
+    """
+    # Breaker open: refuse before any work so the payload stays queued.
+    if not db_available():
+        return _retryable_failure(_db_unavailable_error(db_unavailable_reason()))
+    with checkout_timeout(HOOK_CONN_TIMEOUT):
+        return _ingest_auto_extract(payload)
+
+
+def _ingest_auto_extract(payload: dict) -> dict:
     observations_payload = payload.get("observations", [])
     if not isinstance(observations_payload, list):
         observations_payload = []
@@ -305,7 +409,11 @@ def ingest_auto_extract(payload: dict) -> dict:
             )
             continue
 
-        if _is_duplicate_observation(content, obs_threshold):
+        try:
+            is_duplicate = _is_duplicate_observation(content, obs_threshold)
+        except DatabaseUnavailable as exc:
+            return _retryable_failure(_db_unavailable_error(exc), observation_results)
+        if is_duplicate:
             observation_results.append({"status": "duplicate", "id": "", "error": ""})
             continue
 
@@ -337,6 +445,10 @@ def ingest_auto_extract(payload: dict) -> dict:
             skip_secret_scan=False,
         )
 
+        transient_error = _transient_write_error(write_result)
+        if transient_error:
+            return _retryable_failure(transient_error, observation_results)
+
         if write_result.get("success"):
             status = "duplicate" if write_result.get("deduplicated") else "stored"
             observation_results.append(
@@ -356,7 +468,13 @@ def ingest_auto_extract(payload: dict) -> dict:
         task_summary = _safe_str(worklog_payload.get("task_summary"))
         if task_summary:
             session_id = _safe_str(context.get("session_id"))
-            if _is_duplicate_worklog(task_summary, session_id, worklog_threshold):
+            try:
+                is_duplicate = _is_duplicate_worklog(
+                    task_summary, session_id, worklog_threshold
+                )
+            except DatabaseUnavailable as exc:
+                return _retryable_failure(_db_unavailable_error(exc), observation_results)
+            if is_duplicate:
                 worklog_result = {"status": "duplicate", "id": "", "error": ""}
             else:
                 metadata = _build_common_metadata(context, include_project=True)
@@ -381,6 +499,10 @@ def ingest_auto_extract(payload: dict) -> dict:
                     extra_metadata=metadata,
                     skip_secret_scan=False,
                 )
+
+                transient_error = _transient_write_error(write_result)
+                if transient_error:
+                    return _retryable_failure(transient_error, observation_results)
 
                 if write_result.get("success"):
                     status = (

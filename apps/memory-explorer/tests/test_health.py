@@ -16,4 +16,6 @@ def test_health_reports_ready_sources():
         "status": "ok",
         "server": "memory-explorer",
         "sources": ["local", "obsidian"],
+        # No lifespan ran, so the background DB probe never filled the cache.
+        "postgres": {"status": "unknown", "error": None, "checked_at": None, "free_bytes": None},
     }

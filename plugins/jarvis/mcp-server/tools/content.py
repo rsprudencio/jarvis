@@ -8,11 +8,15 @@ plan, learning, decision, worklog, memory.
 """
 
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from .schema import execute_query, execute_write, metadata_to_jsonb, jsonb_to_metadata
+from .schema import (
+    execute_query, execute_write, is_db_unavailable_error, jsonb_to_metadata,
+    metadata_to_jsonb, note_db_write_ok, safe_db_error,
+)
 from .namespaces import (
     ContentType,
     VALID_CATEGORIES,
@@ -68,6 +72,76 @@ _TYPE_MAP = {
     "decision": (ContentType.DECISION, NAMESPACE_DECISION, decision_id),
     "worklog": (ContentType.WORKLOG, NAMESPACE_WORKLOG, worklog_id),
 }
+
+# Types whose ID is ``<namespace>::<epoch ms>`` from the clock rather than a
+# caller-given name. Such a row must never be overwritten by another write.
+_GENERATED_ID_TYPES = frozenset({"observation", "learning", "worklog"})
+_GENERATED_ID_ATTEMPTS = 5
+_generated_id_lock = threading.Lock()
+_last_generated_ms = 0
+
+
+def _unique_id_ms() -> int:
+    """Epoch milliseconds, strictly increasing within this process.
+
+    Hooks and MCP tools write from worker threads, and the insert used to
+    upsert on id: two writes in the same millisecond got the same ID and the
+    second silently replaced the first while both reported "stored".
+    """
+    global _last_generated_ms
+    with _generated_id_lock:
+        _last_generated_ms = max(int(time.time() * 1000), _last_generated_ms + 1)
+        return _last_generated_ms
+
+
+_INSERT_MEMORY_SQL = """INSERT INTO local.memories
+                       (id, document, embedding, category, scope, project,
+                        source, importance_score, retrieval_count, status,
+                        metadata, created_at, updated_at)
+                       VALUES (%s, %s, %s::halfvec, %s, %s, %s,
+                               %s, %s, 0.0, 'active',
+                               %s::jsonb, %s, %s)"""
+# Caller-named IDs (pattern::<name>, ...) are upserts by design.
+_UPSERT_MEMORY_SQL = _INSERT_MEMORY_SQL + """
+                       ON CONFLICT (id) DO UPDATE SET
+                           document = EXCLUDED.document,
+                           embedding = EXCLUDED.embedding,
+                           category = EXCLUDED.category,
+                           scope = EXCLUDED.scope,
+                           project = EXCLUDED.project,
+                           source = EXCLUDED.source,
+                           importance_score = EXCLUDED.importance_score,
+                           metadata = EXCLUDED.metadata,
+                           updated_at = EXCLUDED.updated_at"""
+# Generated IDs: a taken ID (another process, or a clock step back) is
+# skipped and a fresh one tried, never overwritten.
+_INSERT_NEW_MEMORY_SQL = _INSERT_MEMORY_SQL + """
+                       ON CONFLICT (id) DO NOTHING"""
+
+_INGEST_EVENT_LOOKUP_SQL = (
+    "SELECT id FROM local.memories WHERE metadata->>'ingest_event_id' = %s LIMIT 1"
+)
+# Transaction-scoped advisory lock serializing writes of one ingest_event_id.
+_INGEST_EVENT_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))"
+_INGEST_EVENT_LOCK_PREFIX = "jarvis:ingest_event_id:"
+
+
+def _write_failure(exc: Exception) -> dict:
+    """Error result for a failed write, flagging outages as retryable.
+
+    ``retryable`` lets replay pipelines (the auto-extract hook) keep a payload
+    that failed because PostgreSQL or the model host was down, instead of
+    dropping it like a permanent failure (validation, secret scan, constraint).
+    """
+    from .model_host_client import ModelHostError
+
+    if is_db_unavailable_error(exc):
+        return {"success": False, "error": safe_db_error(exc),
+                "retryable": True, "error_kind": "db_unavailable"}
+    if isinstance(exc, ModelHostError):
+        return {"success": False, "error": str(exc),
+                "retryable": True, "error_kind": "model_host_unavailable"}
+    return {"success": False, "error": str(exc)}
 
 
 def content_write(
@@ -138,8 +212,9 @@ def content_write(
     # Generate ID
     type_const, namespace, id_gen = _TYPE_MAP[content_type]
 
-    if content_type == "observation":
-        doc_id = id_gen()
+    generated_id = content_type in _GENERATED_ID_TYPES
+    if generated_id:
+        doc_id = id_gen(_unique_id_ms())
     elif content_type == "pattern":
         doc_id = id_gen(name)
     elif content_type == "summary":
@@ -167,12 +242,8 @@ def content_write(
             doc_id = id_gen(name or "general", 0)
     elif content_type == "plan":
         doc_id = id_gen(name)
-    elif content_type == "learning":
-        doc_id = id_gen()
     elif content_type == "decision":
         doc_id = id_gen(name)
-    elif content_type == "worklog":
-        doc_id = id_gen()
     else:
         return {"success": False, "error": f"Unknown content_type: {content_type}"}
 
@@ -218,21 +289,21 @@ def content_write(
         from .embedding import get_embedding_service
         from .schema import _get_pool
 
-        # Idempotency for retry/replay pipelines
+        def _deduplicated(existing_id: str) -> dict:
+            return {
+                "success": True,
+                "id": existing_id,
+                "content_type": content_type,
+                "importance_score": importance_score,
+                "deduplicated": True,
+            }
+
+        # Idempotency for retry/replay pipelines. Cheap early exit before the
+        # embedding; re-checked under a lock in the INSERT transaction below.
         if ingest_event_id:
-            existing = execute_query(
-                "SELECT id FROM local.memories WHERE metadata->>'ingest_event_id' = %s LIMIT 1",
-                (ingest_event_id,),
-                fetch="one",
-            )
+            existing = execute_query(_INGEST_EVENT_LOOKUP_SQL, (ingest_event_id,), fetch="one")
             if existing:
-                return {
-                    "success": True,
-                    "id": existing["id"],
-                    "content_type": content_type,
-                    "importance_score": importance_score,
-                    "deduplicated": True,
-                }
+                return _deduplicated(existing["id"])
 
         # Preserve canonical content while embedding bounded search windows.
         service = get_embedding_service()
@@ -248,38 +319,43 @@ def content_write(
         pool = _get_pool()
         with pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """INSERT INTO local.memories
-                       (id, document, embedding, category, scope, project,
-                        source, importance_score, retrieval_count, status,
-                        metadata, created_at, updated_at)
-                       VALUES (%s, %s, %s::halfvec, %s, %s, %s,
-                               %s, %s, 0.0, 'active',
-                               %s::jsonb, %s, %s)
-                       ON CONFLICT (id) DO UPDATE SET
-                           document = EXCLUDED.document,
-                           embedding = EXCLUDED.embedding,
-                           category = EXCLUDED.category,
-                           scope = EXCLUDED.scope,
-                           project = EXCLUDED.project,
-                           source = EXCLUDED.source,
-                           importance_score = EXCLUDED.importance_score,
-                           metadata = EXCLUDED.metadata,
-                           updated_at = EXCLUDED.updated_at""",
-                    (
-                        doc_id,
-                        content,
-                        embedding,
-                        content_type,
-                        scope,
-                        project,
-                        source,
-                        importance_score,
-                        metadata_to_jsonb(metadata),
-                        now_ts,
-                        now_ts,
-                    ),
-                )
+                if ingest_event_id:
+                    # The check above is not atomic with this INSERT: a replay
+                    # can overlap the write it replays (the hook answered 503
+                    # at its deadline while the worker thread carried on).
+                    # Serialize per event id and look again under the lock.
+                    cur.execute(
+                        _INGEST_EVENT_LOCK_SQL, (_INGEST_EVENT_LOCK_PREFIX + ingest_event_id,)
+                    )
+                    cur.execute(_INGEST_EVENT_LOOKUP_SQL, (ingest_event_id,))
+                    existing_row = cur.fetchone()
+                    if existing_row:
+                        conn.commit()  # releases the lock
+                        return _deduplicated(existing_row[0])
+                for _attempt in range(_GENERATED_ID_ATTEMPTS):
+                    cur.execute(
+                        _INSERT_NEW_MEMORY_SQL if generated_id else _UPSERT_MEMORY_SQL,
+                        (
+                            doc_id,
+                            content,
+                            embedding,
+                            content_type,
+                            scope,
+                            project,
+                            source,
+                            importance_score,
+                            metadata_to_jsonb(metadata),
+                            now_ts,
+                            now_ts,
+                        ),
+                    )
+                    if not generated_id or cur.rowcount != 0:
+                        break
+                    doc_id = id_gen(_unique_id_ms())  # taken: never overwrite it
+                else:
+                    raise RuntimeError(
+                        f"no free {namespace} id after {_GENERATED_ID_ATTEMPTS} attempts"
+                    )
                 replace_local_chunks(cur, doc_id, prepared)
 
                 # Transactional outbox: evaluate routing + enqueue sync
@@ -318,6 +394,7 @@ def content_write(
                                    doc_id, e)
 
                 conn.commit()
+        note_db_write_ok()
 
         result = {
             "success": True,
@@ -340,7 +417,7 @@ def content_write(
         return result
     except Exception as e:
         logger.error(f"content_write failed: {e}")
-        return {"success": False, "error": str(e)}
+        return _write_failure(e)
 
 
 def content_read(doc_id: str) -> dict:
@@ -539,7 +616,10 @@ def content_list(
         }
     except Exception as e:
         logger.error(f"content_list failed: {e}")
-        return {"success": False, "error": str(e)}
+        result = {"success": False, "error": str(e)}
+        if is_db_unavailable_error(e):
+            result.update(error=safe_db_error(e), retryable=True)
+        return result
 
 
 def content_delete(doc_id: str, hard: bool = False) -> dict:

@@ -852,7 +852,7 @@ source = { directory = "../../../lib/jarvis-common" }
 
 [[package]]
 name = "jarvis-core"
-version = "3.6.0"
+version = "3.7.0"
 source = { editable = "." }
 dependencies = [
     { name = "jarvis-common" },
@@ -884,7 +884,7 @@ dev = [
 requires-dist = [
     { name = "boto3", marker = "extra == 'bedrock'", specifier = ">=1.28.0" },
     { name = "jarvis-common", directory = "../../../lib/jarvis-common" },
-    { name = "mcp", specifier = ">=1.0.0" },
+    { name = "mcp", specifier = ">=1.0.0,<2.0.0" },
     { name = "mteb", marker = "extra == 'bench'", specifier = ">=2.0.0" },
     { name = "onnxruntime", specifier = ">=1.17.0" },
     { name = "pgvector", specifier = ">=0.3.0" },

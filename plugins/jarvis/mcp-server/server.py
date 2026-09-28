@@ -26,13 +26,17 @@ PKM-specific tools (index_vault, index_file, get_format_reference)
 are conditionally visible based on jarvis-obsidian availability.
 """
 import asyncio
+import contextvars
+import functools
 import inspect
 import json
 import logging
 import os
 import sys
+import threading
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -48,6 +52,7 @@ from tools.paths import (
     PathNotConfiguredError,
 )
 from tools.query import collection_stats
+from tools.schema import db_available, db_unavailable_reason, safe_db_error
 from tools.store import store
 from tools.retrieve import retrieve
 from tools.remove import remove
@@ -486,9 +491,21 @@ def _is_obsidian_available() -> bool:
     return available
 
 
+def _cached_obsidian_availability() -> bool | None:
+    """Fresh cached availability, or None when a health check is due."""
+    if time.time() - _obsidian_cache["checked_at"] < _OBSIDIAN_HEALTH_TTL:
+        return _obsidian_cache["available"]
+    return None
+
+
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    if _is_obsidian_available():
+    available = _cached_obsidian_availability()
+    if available is None:
+        # urlopen blocks for up to its 2s timeout — never on the event loop,
+        # where it would stall /health and every hook with it.
+        available = await asyncio.to_thread(_is_obsidian_available)
+    if available:
         return TOOLS
     return [t for t in TOOLS if t.name not in _PKM_TOOLS]
 
@@ -553,6 +570,21 @@ def handle_get_format_reference() -> dict:
     }
 
 
+# Tool calls run concurrently on _tool_executor; a second full reindex racing
+# the first would redo the work and interleave its chunk deletes/inserts.
+_INDEX_VAULT_LOCK = threading.Lock()
+
+
+def handle_index_vault(args: dict) -> dict:
+    """Handle jarvis_index_vault, one reindex at a time."""
+    with _INDEX_VAULT_LOCK:
+        return index_vault(
+            force=args.get("force", False),
+            directory=args.get("directory"),
+            include_sensitive=args.get("include_sensitive", False),
+        )
+
+
 # Tool name -> handler mapping (module-level to avoid per-call allocation)
 _HANDLERS = {
     # Unified content API
@@ -570,11 +602,7 @@ _HANDLERS = {
         args.get("relative_path", "")
     ),
     # Memory indexing operations
-    "jarvis_index_vault": lambda args: index_vault(
-        force=args.get("force", False),
-        directory=args.get("directory"),
-        include_sensitive=args.get("include_sensitive", False),
-    ),
+    "jarvis_index_vault": lambda args: handle_index_vault(args),
     "jarvis_index_file": lambda args: index_file(args.get("relative_path", "")),
     "jarvis_collection_stats": lambda args: collection_stats(
         sample_size=args.get("sample_size", 5),
@@ -586,14 +614,116 @@ _HANDLERS = {
 }
 
 
+# Sync tool handlers do blocking DB / embedding / filesystem work. They run on
+# this bounded executor: never on the event loop (a 30s pool wait there
+# freezes /health and every hook), and apart from http_app's hook executor so
+# a long reindex can't starve hooks or vice versa.
+_TOOL_WORKERS = 4
+_tool_executor: ThreadPoolExecutor | None = None
+
+# A PostgreSQL that accepts connections but never answers (frozen, not
+# crash-looping) blocks a tool's thread with no timeout of its own. The caller
+# is answered at the deadline (the thread runs on); None = no deadline, for a
+# full reindex that legitimately runs for minutes, one at a time.
+TOOL_DEADLINE_SECONDS = 60.0
+_TOOL_DEADLINES = {"jarvis_index_vault": None}
+# Tools that never touch PostgreSQL: never refused for a DB outage.
+_NON_DB_TOOLS = frozenset({
+    "jarvis_read_vault_file",
+    "jarvis_list_vault_dir",
+    "jarvis_file_exists",
+    "jarvis_resolve_path",
+    "jarvis_get_format_reference",
+})
+# Start time (monotonic) of each running tool call, by worker thread. With
+# every worker busy for this long while the breaker is open, the workers are
+# stuck on the database rather than failing fast against it.
+_WEDGED_AFTER_SECONDS = 2.0
+_tool_calls_lock = threading.Lock()
+_tool_calls_running: dict[int, float] = {}
+
+
+def _get_tool_executor() -> ThreadPoolExecutor:
+    """Lazily create the tool executor (again after a shutdown)."""
+    global _tool_executor
+    if _tool_executor is None:
+        _tool_executor = ThreadPoolExecutor(
+            max_workers=_TOOL_WORKERS, thread_name_prefix="mcp-tool"
+        )
+    return _tool_executor
+
+
+def shutdown_tool_executor() -> None:
+    """Drop queued tool calls without waiting on running ones."""
+    global _tool_executor
+    executor, _tool_executor = _tool_executor, None
+    if executor is not None:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _tracked(call):
+    """Wrap a tool call so its worker thread is listed while it runs."""
+    def run():
+        ident = threading.get_ident()
+        with _tool_calls_lock:
+            _tool_calls_running[ident] = time.monotonic()
+        try:
+            return call()
+        finally:
+            with _tool_calls_lock:
+                _tool_calls_running.pop(ident, None)
+
+    return run
+
+
+def _tool_workers_wedged() -> bool:
+    """Breaker open and every worker stuck for _WEDGED_AFTER_SECONDS: a new
+    call would only queue behind them. Not refused otherwise — with a free
+    worker the tool's own checkouts fail fast, and some tools (memory reads)
+    fall back to files while the database is down."""
+    with _tool_calls_lock:
+        starts = list(_tool_calls_running.values())
+    if len(starts) < _TOOL_WORKERS or db_available():
+        return False
+    return time.monotonic() - max(starts) >= _WEDGED_AFTER_SECONDS
+
+
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    logger.info(f"Tool: {name}, args: {arguments}")
+    # Keys only: values are memory contents and may carry secrets (the
+    # secret scan runs later, inside content_write, and never sees this log).
+    logger.info("Tool: %s, arg_keys: %s", name, sorted((arguments or {}).keys()))
 
     try:
         handler = _HANDLERS.get(name)
-        if handler:
-            result = handler(arguments or {})
+        if handler and name not in _NON_DB_TOOLS and _tool_workers_wedged():
+            result = {
+                "success": False,
+                "retryable": True,
+                "error_kind": "db_unavailable",
+                "error": f"database unavailable: {safe_db_error(db_unavailable_reason())}"
+                         f" ({_TOOL_WORKERS} tool calls still waiting on it)",
+            }
+        elif handler:
+            call = functools.partial(
+                contextvars.copy_context().run, handler, arguments or {}
+            )
+            deadline = _TOOL_DEADLINES.get(name, TOOL_DEADLINE_SECONDS)
+            loop = asyncio.get_running_loop()
+            future = loop.run_in_executor(_get_tool_executor(), _tracked(call))
+            try:
+                result = await asyncio.wait_for(future, deadline)
+            except TimeoutError:
+                if not future.cancelled():
+                    raise  # the tool's own TimeoutError
+                logger.warning("Tool %s exceeded its %gs deadline", name, deadline)
+                result = {
+                    "success": False,
+                    "retryable": True,
+                    "error_kind": "deadline",
+                    "error": f"{name} did not finish within {deadline:g}s and may "
+                             "still complete; check before retrying",
+                }
             if inspect.isawaitable(result):
                 result = await result
         else:
@@ -602,10 +732,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
     except Exception as e:
-        logger.error(f"Error: {e}", exc_info=True)
+        logger.error("Error: %s", safe_db_error(e), exc_info=True)
         return [
             TextContent(
-                type="text", text=json.dumps({"success": False, "error": str(e)})
+                type="text",
+                text=json.dumps({"success": False, "error": safe_db_error(e)}),
             )
         ]
 
@@ -628,7 +759,39 @@ def get_background_tasks():
         sync_worker_loop(),
         retrieval_telemetry_loop(),
         *get_pull_sync_tasks(),
+        db_status_probe_loop(),
     ]
+
+
+DB_STATUS_PROBE_INTERVAL_SECONDS = 10
+DB_STATUS_PROBE_TIMEOUT_SECONDS = 5
+
+
+async def db_status_probe_loop():
+    """Keep the cached DB status (/health "postgres") and the breaker fresh.
+
+    probe_db_status() connects directly with a short connect timeout, so it
+    stays bounded even when the pool is wedged; it still blocks, so it runs
+    in a worker thread and the loop itself only sleeps. connect_timeout does
+    not bound the query after the connect, so the wait is capped too, and a
+    stuck probe is not started again until it returns (no thread pile-up).
+    """
+    from tools.schema import mark_db_probe_stalled, probe_db_status
+
+    probe = None
+    while True:
+        if probe is None or probe.done():
+            probe = asyncio.ensure_future(asyncio.to_thread(probe_db_status))
+        try:
+            await asyncio.wait_for(asyncio.shield(probe), DB_STATUS_PROBE_TIMEOUT_SECONDS)
+        except TimeoutError:
+            logger.warning(
+                "DB status probe still blocked after %ss", DB_STATUS_PROBE_TIMEOUT_SECONDS
+            )
+            mark_db_probe_stalled(DB_STATUS_PROBE_TIMEOUT_SECONDS)
+        except Exception as e:  # never raises by contract; keep the loop alive regardless
+            logger.warning("DB status probe failed: %s", e)
+        await asyncio.sleep(DB_STATUS_PROBE_INTERVAL_SECONDS)
 
 
 async def main():

@@ -261,6 +261,22 @@ class TestQueryVault:
         # when reranking silently fails to apply (vacuous for defect #8).
         assert result["reranking"]["applied"] is True
 
+    def test_rerank_false_skips_an_enabled_reranker(self, mock_config):
+        """Dedup asks for raw similarity on a 2s hook deadline: rerank=False
+        must never reach the (host, up to 1.5s) cross-encoder."""
+        mock_config.set(memory={"reranking": {"enabled": True}})
+        self._index_test_files(mock_config)
+
+        with patch("tools.reranking.rerank") as rerank, \
+                patch("tools.reranking.rerank_multi") as rerank_multi:
+            result = query_vault("authentication decisions", n_results=3, rerank=False)
+
+        assert result["success"] is True
+        assert result["results"]
+        rerank.assert_not_called()
+        rerank_multi.assert_not_called()
+        assert all("similarity" in r for r in result["results"])
+
 
 class TestDocRead:
     """Tests for document read by ID (renamed from memory_read)."""

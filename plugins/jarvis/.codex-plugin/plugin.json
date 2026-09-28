@@ -1,6 +1,6 @@
 {
   "name": "jarvis",
-  "version": "3.6.0+codex.20260729133942",
+  "version": "3.7.0",
   "description": "Core Jarvis - vault management, content API, semantic memory",
   "author": {
     "name": "Raphael Prudencio"

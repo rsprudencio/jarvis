@@ -20,15 +20,20 @@ Safety:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import os
+import re
 import sys
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
+import psycopg
 import psycopg_pool
 from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pgvector.psycopg import register_vector
 from psycopg import sql
 from pydantic import BaseModel
@@ -44,6 +49,12 @@ if str(_MCP) not in sys.path:
 from tools.config import get_embedding_config, get_postgres_config, get_sync_config  # noqa: E402
 from tools.embedding import get_embedding_service  # noqa: E402
 from tools.remote_connection import get_remote_pool  # noqa: E402
+from tools.schema import (  # noqa: E402
+    INVALID_CONNINFO_MESSAGE,
+    is_conninfo_parse_error,
+    redact_known_secrets,
+    register_conninfo_secret,
+)
 from jarvis_common.sync_validation import redact_dsn  # noqa: E402
 from jarvis_common.routing import evaluate_routing, parse_routing_rule  # noqa: E402
 from app_admin import admin_router, require_auth  # noqa: E402
@@ -58,21 +69,266 @@ _MAX_PAGE_SIZE = 100
 # ── Module state ────────────────────────────────────────────────────────────
 _local_pool: Optional[psycopg_pool.ConnectionPool] = None
 _sources: dict[str, dict] = {}
+# Monotonic time of the last discovery attempt. None until lifespan's first
+# discovery — lazy re-discovery only maintains a cache lifespan populated.
+_sources_at: Optional[float] = None
+_sources_lock = asyncio.Lock()
+_discovery_runs = 0
+_refresh_task: Optional[asyncio.Task] = None
+_db_probe_task: Optional[asyncio.Task] = None
+_last_disk_full_at: Optional[float] = None
+# Cached result of _probe_db_status(), served by /health without blocking.
+_db_status: dict = {"status": "unknown", "error": None, "checked_at": None, "free_bytes": None}
+# Monotonic time the status probe last failed to reach the local database
+# (connect refused/rejected, or no answer); None once a probe gets through.
+_db_unreachable_at: Optional[float] = None
+
+# An interactive UI must fail in seconds: psycopg_pool's default 30s wait
+# turned a Postgres outage into a 30s spinner plus a raw PoolTimeout.
+_POOL_TIMEOUT = 5.0
+_PROBE_TIMEOUT = 3.0          # per source-discovery probe checkout
+_SOURCES_TTL = 60.0           # re-discover sources lazily after this
+_DB_PROBE_INTERVAL = 10.0
+_DB_PROBE_WAIT = 5.0          # cap on one background probe (connect + query)
+_DB_CONNECT_TIMEOUT = 2       # direct connect used to learn the real cause
+_LOW_DISK_BYTES = 64 * 1024 * 1024
+_DISK_FULL_WINDOW = 300.0
+# A recent disk-full error stops forcing "disk_full" after this long without
+# another one, once a probe connects and sees enough free space (core: same).
+_DISK_FULL_CLEAR = 60.0
+# While the probe's "unreachable" verdict is younger than this (one probe
+# cycle), local-database requests get their 503 at once instead of waiting
+# out _POOL_TIMEOUT each.
+_FAST_FAIL_WINDOW = _DB_PROBE_INTERVAL + _DB_PROBE_WAIT
+_RETRY_AFTER = {"Retry-After": "10"}
+# A Postgres that accepts connections but never answers blocks a request's
+# thread with no timeout of its own (statement_timeout is enforced by the very
+# server that froze). The request is answered 504 at this deadline.
+_DB_CALL_DEADLINE = 15.0
+_DB_ANALYSIS_DEADLINE = 60.0  # simulate / export scan all of telemetry
+# Forced re-discovery (unknown source) is bounded: it probes every source and
+# every configured remote, and any GET — even a cross-site one — can ask.
+_FORCED_DISCOVERY_INTERVAL = 10.0
+_forced_discovery_at: Optional[float] = None
 
 
 # ── Pool helpers ─────────────────────────────────────────────────────────────
 
 def _make_local_pool() -> psycopg_pool.ConnectionPool:
     url = get_postgres_config()["url"]
+    register_conninfo_secret(url)
     logger.info("Connecting to local PG: %s", redact_dsn(url))
     return psycopg_pool.ConnectionPool(
         conninfo=url,
         min_size=1,
         max_size=5,
         open=True,
+        timeout=_POOL_TIMEOUT,
+        # Replace connections a PG crash/restart left broken instead of
+        # handing them to a request ("server closed the connection").
+        check=psycopg_pool.ConnectionPool.check_connection,
         kwargs={"connect_timeout": 5},
         configure=lambda conn: register_vector(conn),
     )
+
+
+# ── Database status ─────────────────────────────────────────────────────────
+
+# 57P03 (cannot_connect_now) texts; libpq reports no SQLSTATE on a failed
+# connect, so the server's message is the only signal.
+_RECOVERING_RE = re.compile(
+    r"the database system is (in recovery mode|starting up|shutting down"
+    r"|not yet accepting connections|not accepting connections)"
+)
+_CONN_TARGET_RE = re.compile(
+    r'connection to server (?:at "[^"]*"(?: \([^)]*\))?, port \d+|on socket "[^"]*") failed:\s*'
+)
+
+
+def _db_err_reason(e: Exception) -> str:
+    """The server's reason for a DB error, without host/port/socket or DSN."""
+    msg = str(e).strip().split("\n", 1)[0]
+    msg = _CONN_TARGET_RE.sub("", msg)
+    msg = re.sub(r"^(?:connection failed|connection is bad):\s*", "", msg)
+    msg = re.sub(r"^(?:FATAL|ERROR|PANIC):\s+", "", msg)
+    return _safe_err(Exception(" ".join(msg.split()) or type(e).__name__))
+
+
+def _note_db_error(e: Exception) -> None:
+    """Remember a disk-full error so /health can report disk_full for a while."""
+    global _last_disk_full_at
+    if (
+        isinstance(e, psycopg.errors.DiskFull)
+        or getattr(e, "sqlstate", None) == "53100"
+        or "No space left on device" in str(e)
+    ):
+        _last_disk_full_at = time.monotonic()
+
+
+def _pgdata_free_bytes() -> Optional[int]:
+    """Free bytes on an embedded Postgres data dir, or None if not local."""
+    try:
+        st = os.statvfs(os.environ.get("PGDATA") or "/var/lib/postgresql/data")
+    except OSError:
+        return None
+    return st.f_bavail * st.f_frsize
+
+
+def _probe_db_status() -> dict:
+    """BLOCKING (run in a thread): classify Postgres health and cache it.
+
+    Uses a direct connection, not the pool: the pool only ever reports that
+    it waited, while the server's FATAL ('the database system is in recovery
+    mode') is what explains the outage. Never raises.
+    """
+    global _db_status, _db_unreachable_at, _last_disk_full_at
+    status, error = "ok", None
+    try:
+        url = get_postgres_config()["url"]
+        register_conninfo_secret(url)
+        with psycopg.connect(url, connect_timeout=_DB_CONNECT_TIMEOUT) as conn:
+            row = conn.execute("SELECT pg_is_in_recovery()").fetchone()
+            if row and row[0]:
+                status, error = "recovering", "the database system is in recovery"
+        _db_unreachable_at = None
+    except Exception as e:
+        _db_unreachable_at = time.monotonic()
+        _note_db_error(e)
+        error = _db_err_reason(e)
+        recovering = getattr(e, "sqlstate", None) == "57P03" or _RECOVERING_RE.search(str(e))
+        status = "recovering" if recovering else "unreachable"
+    free = _pgdata_free_bytes()
+    low_space = free is not None and free < _LOW_DISK_BYTES
+    now = time.monotonic()
+    if (
+        _last_disk_full_at is not None
+        and status == "ok"
+        and free is not None
+        and not low_space
+        and now - _last_disk_full_at >= _DISK_FULL_CLEAR
+    ):
+        _last_disk_full_at = None  # writing again: space is back, errors stopped
+    recent_disk_full = (
+        _last_disk_full_at is not None and now - _last_disk_full_at < _DISK_FULL_WINDOW
+    )
+    if recent_disk_full or low_space:
+        status = "disk_full"
+        detail = (
+            f"PGDATA free space low ({free // (1024 * 1024)} MiB)" if low_space
+            else "disk full (No space left on device)"
+        )
+        # Keep the connect error too: "disk full; Connection refused" says
+        # both what happened and why the server is down.
+        error = detail if error is None else f"{detail}; {error}"
+    _db_status = {"status": status, "error": error, "checked_at": time.time(), "free_bytes": free}
+    return _db_status
+
+
+class _LocalDbDown(psycopg.OperationalError):
+    """The status probe could not reach the local database moments ago."""
+
+
+def _check_local_db() -> None:
+    """Fail at once while the local database is known to be unreachable.
+
+    Every request used to wait out _POOL_TIMEOUT (5s) before its 503 during
+    an outage. Only a verdict younger than _FAST_FAIL_WINDOW counts, so a
+    recovered database is used again within one probe cycle.
+    """
+    down_at = _db_unreachable_at
+    if down_at is not None and time.monotonic() - down_at < _FAST_FAIL_WINDOW:
+        raise _LocalDbDown(_db_status.get("error") or "PostgreSQL is unreachable")
+
+
+def _local_connection():
+    """A local-pool checkout, or an immediate _LocalDbDown during an outage."""
+    _check_local_db()
+    return _local_pool.connection()
+
+
+def _db_unavailable_detail(src: Optional[dict] = None) -> str:
+    """BLOCKING: explain a pool timeout with the server's actual reason."""
+    if src is not None and src.get("type") != "local":
+        return "Database unavailable: remote connection timed out"
+    st = _probe_db_status()
+    if st["status"] == "ok":
+        return "Database unavailable: connection pool exhausted"
+    return "Database unavailable: " + (st["error"] or st["status"])
+
+
+def _core_db_unavailable(e: Exception) -> bool:
+    """Core's circuit breaker error (semantic mode runs on core's pool).
+
+    Resolved at call time from the loaded tools.schema module, so a reloaded
+    module's class still matches.
+    """
+    schema = sys.modules.get("tools.schema")
+    cls = getattr(schema, "DatabaseUnavailable", None)
+    return isinstance(cls, type) and isinstance(e, cls)
+
+
+async def _db_unavailable_error(e: Exception, src: Optional[dict] = None) -> HTTPException:
+    """Map DB unavailability to a fast 503 that carries the real cause."""
+    if isinstance(e, _LocalDbDown):
+        # The probe's verdict (already sanitized); no second probe per request.
+        detail = "Database unavailable: " + str(e)
+    elif isinstance(e, (psycopg_pool.PoolTimeout, psycopg_pool.TooManyRequests)) or _core_db_unavailable(e):
+        detail = await asyncio.to_thread(_db_unavailable_detail, src)
+    else:
+        _note_db_error(e)
+        detail = "Database unavailable: " + _db_err_reason(e)
+    logger.warning("%s", detail)
+    return HTTPException(503, detail, headers=_RETRY_AFTER)
+
+
+class _DbCallTimedOut(psycopg.errors.QueryCanceled):
+    """A DB call outlived its deadline; handled (504) like statement_timeout."""
+
+
+async def _run_db(fn, *args, deadline: Optional[float] = None, local_db: bool = False):
+    """Run a blocking DB call in a thread, bounded by ``deadline``
+    (default _DB_CALL_DEADLINE).
+
+    Raises _DbCallTimedOut at the deadline. The thread is abandoned, not
+    killed: it ends when the database answers or the connection breaks.
+    ``local_db`` marks a call on the local database made through core's pool
+    (the Retrieval tab): it fails fast like _local_connection() does.
+    """
+    if local_db:
+        _check_local_db()
+    if deadline is None:
+        deadline = _DB_CALL_DEADLINE
+    loop = asyncio.get_running_loop()
+    try:
+        return await asyncio.wait_for(loop.run_in_executor(None, fn, *args), deadline)
+    except TimeoutError:
+        raise _DbCallTimedOut(f"database did not answer within {deadline:g}s") from None
+
+
+async def _db_status_loop() -> None:
+    """Refresh the cached DB status for /health off the event loop.
+
+    connect_timeout does not bound the query after the connect, so the wait
+    is capped and a stuck probe is not started again until it returns.
+    """
+    global _db_status, _db_unreachable_at
+    probe: Optional[asyncio.Future] = None
+    while True:
+        if probe is None or probe.done():
+            probe = asyncio.ensure_future(asyncio.to_thread(_probe_db_status))
+        try:
+            await asyncio.wait_for(asyncio.shield(probe), _DB_PROBE_WAIT)
+        except TimeoutError:
+            _db_unreachable_at = time.monotonic()
+            _db_status = {
+                **_db_status,
+                "status": "unreachable",
+                "error": f"no answer to the status probe within {_DB_PROBE_WAIT:g}s",
+                "checked_at": time.time(),
+            }
+        except Exception as e:  # executor gone during shutdown
+            logger.debug("DB status probe skipped: %s", e)
+        await asyncio.sleep(_DB_PROBE_INTERVAL)
 
 
 def _probe_source(pool_fn, schema: str, table: str) -> bool:
@@ -114,7 +370,9 @@ def _discover_sources(local_pool: psycopg_pool.ConnectionPool) -> dict[str, dict
     dims = get_embedding_config()["dimensions"]
 
     def lconn():
-        return local_pool.connection()
+        # Short wait: with PG down every failed probe waits this long, at
+        # startup (before uvicorn binds) and on each re-discovery.
+        return local_pool.connection(timeout=_PROBE_TIMEOUT)
 
     # local.memories
     if _probe_source(lconn, "local", "memories"):
@@ -183,20 +441,132 @@ def _discover_sources(local_pool: psycopg_pool.ConnectionPool) -> dict[str, dict
     return sources
 
 
+async def _rediscover_sources() -> None:
+    """Re-run source discovery in a thread, one run at a time.
+
+    An explorer started while Postgres was down cached an empty source list
+    forever (400 "Unknown source: 'local'" until restart).
+    """
+    global _sources, _sources_at, _discovery_runs
+    runs = _discovery_runs
+    async with _sources_lock:
+        if _discovery_runs != runs:
+            return  # a concurrent request just re-discovered; reuse its result
+        try:
+            found = await asyncio.to_thread(_discover_sources, _local_pool)
+        except Exception as e:
+            logger.warning("Source re-discovery failed: %s", _db_err_reason(e))
+            return
+        finally:
+            _discovery_runs += 1
+            _sources_at = time.monotonic()
+        # During an outage every local probe fails: keep the last good list,
+        # whose handlers then answer 503 with the cause.
+        if "local" in found or "local" not in _sources:
+            if found.keys() != _sources.keys():
+                logger.info("Sources re-discovered: %s", list(found.keys()))
+            _sources = found
+
+
+def _discoverable(source: str) -> bool:
+    """Whether a re-discovery could produce ``source`` at all."""
+    if source in ("local", "obsidian"):
+        return True
+    if not source.startswith("remote:"):
+        return False
+    name = source[len("remote:"):]
+    rcfg = get_sync_config().get("remotes", {}).get(name)
+    return isinstance(rcfg, dict) and bool(rcfg.get("enabled", True)) and not name.startswith("_")
+
+
+async def _ensure_sources(source: Optional[str] = None) -> None:
+    """Lazily refresh the source cache before it is used.
+
+    'local' missing, or a requested source that discovery could produce but
+    hasn't, waits for a re-discovery — at most one forced run per
+    _FORCED_DISCOVERY_INTERVAL (requests arriving while one runs share it).
+    Any other unknown id is answered straight away. A merely stale cache
+    refreshes in the background so the healthy path never waits on it.
+    """
+    global _refresh_task, _forced_discovery_at
+    if _sources_at is None or _local_pool is None:
+        return
+    wanted = source is not None and source not in _sources and _discoverable(source)
+    if "local" not in _sources or wanted:
+        now = time.monotonic()
+        if _sources_lock.locked():
+            await _rediscover_sources()  # join the run in flight
+        elif (
+            _forced_discovery_at is None
+            or now - _forced_discovery_at >= _FORCED_DISCOVERY_INTERVAL
+        ):
+            _forced_discovery_at = now
+            await _rediscover_sources()
+    elif time.monotonic() - _sources_at > _SOURCES_TTL and not _sources_lock.locked():
+        if _refresh_task is None or _refresh_task.done():
+            _refresh_task = asyncio.create_task(_rediscover_sources())
+
+
+def _fresh_db_status() -> Optional[dict]:
+    """The background probe's verdict while it is still current, else None."""
+    checked_at = _db_status.get("checked_at")
+    if checked_at is not None and time.time() - checked_at < _DB_PROBE_INTERVAL + _DB_PROBE_WAIT:
+        return _db_status
+    return None
+
+
+async def _unknown_source_error(status: int, detail: str) -> HTTPException:
+    """Unknown source after re-discovery: 503 if the local DB is why."""
+    if _sources_at is not None and "local" not in _sources:
+        # The cached verdict when current: no direct connect per request.
+        st = _fresh_db_status() or await asyncio.to_thread(_probe_db_status)
+        if st["status"] != "ok":
+            reason = "Database unavailable: " + (st["error"] or st["status"])
+            return HTTPException(503, reason, headers=_RETRY_AFTER)
+    return HTTPException(status, detail)
+
+
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _local_pool, _sources
+    global _local_pool, _sources, _sources_at, _sources_lock, _db_probe_task
     _local_pool = _make_local_pool()
     _sources = _discover_sources(_local_pool)
+    _sources_at = time.monotonic()
+    _sources_lock = asyncio.Lock()
+    _db_probe_task = asyncio.create_task(_db_status_loop())
     logger.info("Ready. Sources: %s", list(_sources.keys()))
     yield
+    for task in (_db_probe_task, _refresh_task):
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
     _local_pool.close()
 
 
 app = FastAPI(title="Jarvis Admin", lifespan=lifespan)
 app.include_router(admin_router)
+
+
+# Routes without their own mapping (the Retrieval tab runs on core's pool)
+# would otherwise turn a DB outage into a bare "Internal Server Error".
+@app.exception_handler(psycopg.OperationalError)
+async def _operational_error_handler(request, exc: psycopg.OperationalError):
+    if isinstance(exc, psycopg.errors.QueryCanceled):
+        return JSONResponse({"detail": "query timed out"}, status_code=504)
+    err = await _db_unavailable_error(exc)
+    return JSONResponse({"detail": err.detail}, status_code=503, headers=err.headers)
+
+
+@app.exception_handler(RuntimeError)
+async def _core_unavailable_handler(request, exc: RuntimeError):
+    """Core's DatabaseUnavailable (a RuntimeError) → 503; anything else as before."""
+    if not _core_db_unavailable(exc):
+        raise exc
+    err = await _db_unavailable_error(exc)
+    return JSONResponse({"detail": err.detail}, status_code=503, headers=err.headers)
 
 _CSP = (
     "default-src 'self'; "
@@ -214,6 +584,8 @@ async def health():
         "status": "ok",
         "server": "memory-explorer",
         "sources": sorted(_sources),
+        # Cached by _db_status_loop — /health never touches the DB itself.
+        "postgres": dict(_db_status),
     }
 
 
@@ -224,6 +596,7 @@ async def spa():
 
 @app.get("/api/sources")
 async def list_sources():
+    await _ensure_sources()
     out = []
     for s in _sources.values():
         item = {k: v for k, v in s.items() if k != "remote_name"}
@@ -239,21 +612,25 @@ async def get_stats(source: Optional[str] = Query(default=None)):
         [_sources[source]] if (source and source in _sources)
         else list(_sources.values())
     )
-    loop = asyncio.get_event_loop()
+    # Concurrently: during an outage each source waits out the pool timeout.
+    counts = await asyncio.gather(
+        *(_run_db(_count_sync, src) for src in targets),
+        return_exceptions=True,
+    )
     out = {}
-    for src in targets:
-        try:
-            n = await loop.run_in_executor(None, _count_sync, src)
+    for src, n in zip(targets, counts):
+        if isinstance(n, Exception):
+            out[src["id"]] = {"count": None, "error": _safe_err(n)}
+        else:
             out[src["id"]] = {"count": n}
-        except Exception as e:
-            out[src["id"]] = {"count": None, "error": _safe_err(e)}
     return out
 
 
 def _count_sync(src: dict) -> int:
     if src["type"] == "local":
-        with _local_pool.connection() as conn:
+        with _local_connection() as conn:
             conn.execute("SET TRANSACTION READ ONLY")
+            conn.execute("SET statement_timeout = '10000'")
             row = conn.execute(
                 sql.SQL("SELECT COUNT(*) FROM {}.{}").format(
                     sql.Identifier(src["schema"]), sql.Identifier(src["table"])
@@ -264,6 +641,7 @@ def _count_sync(src: dict) -> int:
         pool = get_remote_pool(src["remote_name"])
         with pool.connection() as conn:
             conn.execute("SET TRANSACTION READ ONLY")
+            conn.execute("SET statement_timeout = '10000'")
             row = conn.execute(
                 sql.SQL("SELECT COUNT(*) FROM {}.memory_refs").format(
                     sql.Identifier(src["schema"])
@@ -358,8 +736,9 @@ def _local_sem_cols(has_rc: bool) -> str:
 
 @app.post("/api/search")
 async def search(req: SearchRequest):
+    await _ensure_sources(req.source)
     if req.source not in _sources:
-        raise HTTPException(400, f"Unknown source: {req.source!r}")
+        raise await _unknown_source_error(400, f"Unknown source: {req.source!r}")
     src = _sources[req.source]
     if req.mode not in ("text", "semantic", "metadata"):
         raise HTTPException(400, f"Invalid mode: {req.mode!r}")
@@ -368,7 +747,6 @@ async def search(req: SearchRequest):
     if not (0 < req.page_size <= _MAX_PAGE_SIZE):
         raise HTTPException(400, "page_size must be between 1 and 100")
 
-    loop = asyncio.get_event_loop()
     try:
         # Production host inference uses the shared core primitive. Local
         # development with the legacy in-process backend keeps the direct SQL
@@ -379,14 +757,22 @@ async def search(req: SearchRequest):
             and get_embedding_config().get("backend") == "host"
         )
         if shared_semantic:
-            result = await loop.run_in_executor(None, _semantic_search_sync, src, req)
+            result = await _run_db(_semantic_search_sync, src, req)
         else:
-            result = await loop.run_in_executor(None, _search_sync, src, req)
+            result = await _run_db(_search_sync, src, req)
             if req.mode == "semantic":
-                result["trace_id"] = await loop.run_in_executor(
-                    None, _trace_remote_explorer_search, src, req, result
+                result["trace_id"] = await _run_db(
+                    _trace_remote_explorer_search, src, req, result
                 )
+    # QueryCanceled (statement_timeout) is an OperationalError subclass:
+    # it must be matched first or it would read as "Database unavailable".
+    except psycopg.errors.QueryCanceled:
+        raise HTTPException(504, "query timed out")
+    except psycopg.OperationalError as e:  # incl. PoolTimeout
+        raise await _db_unavailable_error(e, src)
     except Exception as e:
+        if _core_db_unavailable(e):
+            raise await _db_unavailable_error(e, src)
         logger.exception("Search error")
         raise HTTPException(500, _safe_err(e))
     return {
@@ -403,6 +789,8 @@ async def search(req: SearchRequest):
 def _semantic_search_sync(src: dict, req: SearchRequest) -> dict:
     """Route Explorer semantic mode through Jarvis core's shared recall."""
     from tools.query import semantic_candidate_search
+
+    _check_local_db()  # core's pool, same local database
 
     schema_name = src["schema"]
     result = semantic_candidate_search(
@@ -464,8 +852,7 @@ def _trace_remote_explorer_search(src: dict, req: SearchRequest, result: dict) -
 async def retrieval_summary(days: int = Query(default=7, ge=1, le=90)):
     from tools.retrieval_telemetry import get_summary
 
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, lambda: get_summary(days))
+    return await _run_db(lambda: get_summary(days), local_db=True)
 
 
 @app.get("/api/retrieval/events")
@@ -477,10 +864,9 @@ async def retrieval_events(
 ):
     from tools.retrieval_telemetry import list_events
 
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        None,
+    return await _run_db(
         lambda: list_events(limit=limit, offset=offset, purpose=purpose, outcome=outcome),
+        local_db=True,
     )
 
 
@@ -488,8 +874,7 @@ async def retrieval_events(
 async def retrieval_event(event_id: str):
     from tools.retrieval_telemetry import get_event
 
-    loop = asyncio.get_running_loop()
-    event = await loop.run_in_executor(None, lambda: get_event(event_id))
+    event = await _run_db(lambda: get_event(event_id), local_db=True)
     if not event:
         raise HTTPException(404, "Retrieval event not found")
     return event
@@ -504,12 +889,11 @@ async def retrieval_event_documents(
     """Resolve candidate bodies on demand — telemetry stores only locators."""
     from tools.retrieval_telemetry import get_event_documents
 
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        None,
+    return await _run_db(
         lambda: get_event_documents(
             event_id, preview_chars=preview_chars, candidate_key=candidate_key or None
         ),
+        local_db=True,
     )
 
 
@@ -521,10 +905,9 @@ async def retrieval_event_feedback(
 ):
     from tools.retrieval_telemetry import put_event_feedback
 
-    loop = asyncio.get_running_loop()
     try:
-        await loop.run_in_executor(
-            None, lambda: put_event_feedback(event_id, req.model_dump(), user)
+        await _run_db(
+            lambda: put_event_feedback(event_id, req.model_dump(), user), local_db=True
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc))
@@ -540,11 +923,10 @@ async def retrieval_candidate_feedback(
 ):
     from tools.retrieval_telemetry import put_candidate_feedback
 
-    loop = asyncio.get_running_loop()
     try:
-        await loop.run_in_executor(
-            None,
+        await _run_db(
             lambda: put_candidate_feedback(event_id, candidate_key, req.model_dump(), user),
+            local_db=True,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc))
@@ -555,9 +937,11 @@ async def retrieval_candidate_feedback(
 async def retrieval_simulate(req: SimulationRequest):
     from tools.retrieval_telemetry import simulate_policy
 
-    loop = asyncio.get_running_loop()
     try:
-        return await loop.run_in_executor(None, lambda: simulate_policy(req.model_dump()))
+        return await _run_db(
+            lambda: simulate_policy(req.model_dump()),
+            deadline=_DB_ANALYSIS_DEADLINE, local_db=True,
+        )
     except ValueError as exc:
         raise HTTPException(400, str(exc))
 
@@ -566,8 +950,9 @@ async def retrieval_simulate(req: SimulationRequest):
 async def retrieval_export():
     from tools.retrieval_telemetry import export_labeled_events
 
-    loop = asyncio.get_running_loop()
-    rows = await loop.run_in_executor(None, export_labeled_events)
+    rows = await _run_db(
+        export_labeled_events, deadline=_DB_ANALYSIS_DEADLINE, local_db=True
+    )
     return {"schema_version": 1, "exported_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc), "events": rows}
 
 
@@ -603,7 +988,7 @@ def _search_sync(src: dict, req: SearchRequest) -> dict:
             else sql.SQL("status != 'deleted'")
         )
 
-        with _local_pool.connection() as conn:
+        with _local_connection() as conn:
             conn.execute("SET TRANSACTION READ ONLY")
             conn.execute("SET statement_timeout = '10000'")
 
@@ -743,12 +1128,16 @@ def _search_sync(src: dict, req: SearchRequest) -> dict:
 
 @app.get("/api/content")
 async def get_content(source: str = Query(...), id: str = Query(...)):
+    await _ensure_sources(source)
     if source not in _sources:
-        raise HTTPException(404, "Source not found")
+        raise await _unknown_source_error(404, "Source not found")
     src = _sources[source]
-    loop = asyncio.get_event_loop()
     try:
-        item = await loop.run_in_executor(None, _fetch_content_sync, src, id)
+        item = await _run_db(_fetch_content_sync, src, id)
+    except psycopg.errors.QueryCanceled:
+        raise HTTPException(504, "query timed out")
+    except psycopg.OperationalError as e:
+        raise await _db_unavailable_error(e, src)
     except Exception as e:
         logger.exception("Content fetch error")
         raise HTTPException(500, _safe_err(e))
@@ -760,8 +1149,9 @@ async def get_content(source: str = Query(...), id: str = Query(...)):
 def _fetch_content_sync(src: dict, item_id: str) -> Optional[dict]:
     if src["type"] == "local":
         schema, table = src["schema"], src["table"]
-        with _local_pool.connection() as conn:
+        with _local_connection() as conn:
             conn.execute("SET TRANSACTION READ ONLY")
+            conn.execute("SET statement_timeout = '10000'")
             cur = conn.execute(
                 sql.SQL(
                     "SELECT * FROM {}.{} WHERE id = %s"
@@ -778,6 +1168,7 @@ def _fetch_content_sync(src: dict, item_id: str) -> Optional[dict]:
         s = sql.Identifier(src["schema"])
         with pool.connection() as conn:
             conn.execute("SET TRANSACTION READ ONLY")
+            conn.execute("SET statement_timeout = '10000'")
             cur = conn.execute(
                 sql.SQL(
                     "SELECT r.*, c.content"
@@ -795,7 +1186,7 @@ def _fetch_content_sync(src: dict, item_id: str) -> Optional[dict]:
 
 def _delete_sync(item_id: str) -> dict:
     """Soft-delete a memory from local.memories and enqueue remote sync."""
-    with _local_pool.connection() as conn:
+    with _local_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """UPDATE local.memories
@@ -828,15 +1219,19 @@ async def delete_memory(
     _user: str = Depends(require_auth),
 ):
     """Soft-delete a memory from local.memories."""
+    await _ensure_sources(source)
     if source not in _sources:
-        raise HTTPException(404, "Source not found")
+        raise await _unknown_source_error(404, "Source not found")
     src = _sources[source]
     if not (src["type"] == "local" and src["schema"] == "local"):
         raise HTTPException(403, "Deletion only supported for local memories")
 
-    loop = asyncio.get_running_loop()
     try:
-        result = await loop.run_in_executor(None, _delete_sync, item_id)
+        result = await _run_db(_delete_sync, item_id)
+    except psycopg.errors.QueryCanceled:
+        raise HTTPException(504, "query timed out")
+    except psycopg.OperationalError as e:
+        raise await _db_unavailable_error(e, src)
     except Exception as e:
         logger.exception("Delete error")
         raise HTTPException(500, _safe_err(e))
@@ -965,7 +1360,10 @@ def _rows_to_dicts(rows: list, mode: str, has_rc: bool = True, extract_user: boo
 
 def _safe_err(e: Exception) -> str:
     """Return a sanitized error message safe for API responses."""
-    msg = str(e)
+    msg = redact_known_secrets(str(e))
+    # libpq quotes an unparseable conninfo component verbatim: the password.
+    if is_conninfo_parse_error(msg):
+        return INVALID_CONNINFO_MESSAGE
     # Strip any potential DSN/credential leakage
     if "@" in msg and "//" in msg:
         return "Database error (credentials redacted)"
@@ -977,9 +1375,12 @@ def _safe_err(e: Exception) -> str:
 @app.get("/api/admin")
 async def admin_data():
     """Return sync system status for the admin dashboard."""
-    loop = asyncio.get_event_loop()
     try:
-        data = await loop.run_in_executor(None, _admin_sync)
+        data = await _run_db(_admin_sync)
+    except psycopg.errors.QueryCanceled:
+        raise HTTPException(504, "query timed out")
+    except psycopg.OperationalError as e:
+        raise await _db_unavailable_error(e)
     except Exception as e:
         logger.exception("Admin data error")
         raise HTTPException(500, _safe_err(e))
@@ -1021,8 +1422,9 @@ def _admin_sync() -> dict:
     last_fail = None
 
     try:
-        with _local_pool.connection() as conn:
+        with _local_connection() as conn:
             conn.execute("SET TRANSACTION READ ONLY")
+            conn.execute("SET statement_timeout = '10000'")
 
             # Per-destination status counts
             rows = conn.execute(
@@ -1141,8 +1543,9 @@ def _admin_sync() -> dict:
     # Memory stats
     mem_stats = {}
     try:
-        with _local_pool.connection() as conn:
+        with _local_connection() as conn:
             conn.execute("SET TRANSACTION READ ONLY")
+            conn.execute("SET statement_timeout = '10000'")
             # Total across all statuses (matches sidebar count)
             total_row = conn.execute(
                 "SELECT count(*) FROM local.memories"
@@ -1556,7 +1959,7 @@ function showDetail(id) {
   body.innerHTML = '<div class="empty" style="padding:20px">Loading...</div>';
 
   fetch('/api/content?source=' + encodeURIComponent(cur) + '&id=' + encodeURIComponent(id))
-    .then(r => r.json())
+    .then(r => { if (!r.ok) return apiError(r); return r.json(); })
     .then(d => {
       let html = '';
 
@@ -1688,7 +2091,7 @@ function run(append) {
   var body = { source: cur, mode: mode, query: q, filters: filters(), page: page, page_size: 100, sort_by: serverSort };
   document.getElementById('statusbar').textContent = 'Searching...';
   fetch('/api/search', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) })
-    .then(r => { if (!r.ok) return r.text().then(t => Promise.reject(t)); return r.json(); })
+    .then(r => { if (!r.ok) return apiError(r); return r.json(); })
     .then(data => {
       var res = data.results || [];
       if (append) {
@@ -1706,6 +2109,21 @@ function run(append) {
 }
 
 function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// Reject with a readable message for a non-2xx response. The body is read
+// exactly once (as text), then FastAPI's {"detail": ...} is used if present.
+// Callers must render the message via textContent or esc().
+function apiError(r) {
+  return r.text().then(function(t) {
+    var m = t || ('HTTP ' + r.status);
+    try {
+      var d = JSON.parse(t);
+      if (d && d.detail) m = typeof d.detail === 'string' ? d.detail : JSON.stringify(d.detail);
+    } catch (_) {}
+    if (r.status === 503 && m.indexOf('Database unavailable') !== 0) m = 'Database unavailable: ' + m;
+    return Promise.reject(m);
+  });
+}
 
 document.getElementById('q').addEventListener('keydown', function(e) { if (e.key === 'Enter') run(); });
 
@@ -1740,9 +2158,7 @@ function deleteMemory(id) {
   if (!confirm('Delete this memory? (soft-delete — sets status to deleted)')) return;
   fetch('/api/memories/' + encodeURIComponent(id) + '?source=' + encodeURIComponent(cur), { method: 'DELETE' })
     .then(function(r) {
-      if (!r.ok) return r.json().catch(function() { return r.text(); }).then(function(d) {
-        return Promise.reject(typeof d === 'object' ? (d.detail || JSON.stringify(d)) : d);
-      });
+      if (!r.ok) return apiError(r);
       return r.json();
     })
     .then(function() {
@@ -1810,7 +2226,7 @@ function loadRetrieval() {
   var outcome = document.getElementById('rt-outcome');
   var filters = { purpose: purpose ? purpose.value : '', outcome: outcome ? outcome.value : '' };
   var query = '?limit=100' + (filters.purpose ? '&purpose='+encodeURIComponent(filters.purpose) : '') + (filters.outcome ? '&outcome='+encodeURIComponent(filters.outcome) : '');
-  Promise.all([fetch('/api/retrieval/summary').then(r=>r.json()), fetch('/api/retrieval/events'+query).then(r=>r.json())])
+  Promise.all([fetch('/api/retrieval/summary').then(r=>r.ok?r.json():apiError(r)), fetch('/api/retrieval/events'+query).then(r=>r.ok?r.json():apiError(r))])
     .then(parts => { retrievalLoaded=true; renderRetrieval(parts[0], parts[1], filters); })
     .catch(err => { el.innerHTML='<div class="empty" style="color:var(--red)">'+esc(String(err))+'</div>'; });
 }

@@ -100,13 +100,18 @@ def _git_info() -> dict:
 def _jarvis_health() -> dict:
     """Quick Jarvis MCP server health check (cached).
 
-    Returns dict with keys: ok, pg_status, doc_count, repl_mode.
+    /health stays HTTP 200 with top-level status "ok" while the server is up;
+    database state rides along as the server's cached probe:
+    postgres = {status: ok|recovering|unreachable|disk_full|unknown,
+    error, checked_at, free_bytes}.
+
+    Returns dict with keys: ok, pg_status, pg_free_bytes, repl_mode.
     """
     cached = _read_cache("jarvis.json", JARVIS_CACHE_TTL)
     if cached:
         return cached
 
-    info = {"ok": False, "pg_status": "", "doc_count": 0, "repl_mode": ""}
+    info = {"ok": False, "pg_status": "", "pg_free_bytes": None, "repl_mode": ""}
     try:
         result = subprocess.run(
             ["curl", "-sf", "--max-time", "2", "http://localhost:8741/health"],
@@ -114,12 +119,19 @@ def _jarvis_health() -> dict:
         )
         if result.returncode == 0:
             data = json.loads(result.stdout)
+            if not isinstance(data, dict):
+                data = {}
             info["ok"] = data.get("status") == "ok"
-            pg = data.get("postgres", {})
-            info["pg_status"] = pg.get("status", "")
-            info["doc_count"] = pg.get("doc_count", 0)
-            repl = data.get("replication", {})
-            info["repl_mode"] = repl.get("mode", "")
+            pg = data.get("postgres")
+            if isinstance(pg, dict):
+                status = pg.get("status")
+                info["pg_status"] = status if isinstance(status, str) else ""
+                free = pg.get("free_bytes")
+                if isinstance(free, int) and not isinstance(free, bool):
+                    info["pg_free_bytes"] = free
+            repl = data.get("replication")
+            if isinstance(repl, dict) and isinstance(repl.get("mode"), str):
+                info["repl_mode"] = repl["mode"]
     except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
         pass
 
@@ -163,6 +175,47 @@ def _fmt_context(data: dict) -> str:
     return f"{GREEN}{s}{RESET}"
 
 
+def _fmt_bytes(n) -> str:
+    if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+        return ""
+    units = ["B", "K", "M", "G", "T"]
+    value = float(n)
+    unit = 0
+    while value >= 1024 and unit < len(units) - 1:
+        value /= 1024
+        unit += 1
+    if value >= 10 or unit == 0:
+        return f"{value:.0f}{units[unit]}"
+    return f"{value:.1f}{units[unit]}"
+
+
+# Known /health postgres.status values -> (label, color). "ok" renders nothing.
+_PG_STATUS_LABELS = {
+    "recovering": ("recovering", RED),
+    "unreachable": ("unreachable", RED),
+    "disk_full": ("disk full", RED),
+    "unknown": ("unknown", YELLOW),
+}
+
+
+def _fmt_pg_status(status: str, free_bytes=None) -> str:
+    """Red "DB: <state>" segment when the database is not ok, else ""."""
+    if not status or status == "ok":
+        return ""
+    label, color = _PG_STATUS_LABELS.get(status, ("", RED))
+    if not label:
+        # Unrecognized value from the server: never echo raw text (escape
+        # sequences) into the terminal.
+        label = "".join(
+            ch for ch in status.lower() if ch.isascii() and (ch.isalnum() or ch in "_-")
+        )[:24] or "error"
+    if status == "disk_full":
+        free = _fmt_bytes(free_bytes)
+        if free:
+            label += f" ({free} free)"
+    return f"{color}DB: {label}{RESET}"
+
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -191,16 +244,15 @@ def generate(data: dict) -> str:
     if account:
         parts.append(f"{GREEN}{BOLD}{account}{RESET}")
 
-    # Jarvis branding with PG health (only when healthy)
+    # Jarvis branding (only when the server answers /health) plus a DB
+    # segment whenever its cached Postgres probe is not ok
     if jarvis.get("ok"):
         jarvis_label = f"{BOLD}{YELLOW}\u26a1{RESET} {YELLOW}JARVIS{RESET}"
-        # Append pg:ok(N) with doc count
-        pg_status = jarvis.get("pg_status", "")
-        doc_count = jarvis.get("doc_count", 0)
-        if pg_status == "ok":
-            jarvis_label += f" {GREEN}pg:ok({doc_count}){RESET}"
-        elif pg_status:
-            jarvis_label += f" {RED}pg:{pg_status}{RESET}"
+        pg_segment = _fmt_pg_status(
+            jarvis.get("pg_status", ""), jarvis.get("pg_free_bytes")
+        )
+        if pg_segment:
+            jarvis_label += f" {pg_segment}"
         # Replication indicator
         repl_mode = jarvis.get("repl_mode", "")
         if repl_mode and repl_mode != "disabled":

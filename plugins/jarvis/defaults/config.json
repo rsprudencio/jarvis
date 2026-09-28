@@ -11,6 +11,7 @@
   "configured_at": "__REQUIRED__",
   "memory": {
     "postgres_url": "postgresql://jarvis:jarvis@localhost:5432/jarvis",
+    "pool_timeout_seconds": 10,
     "embedding_model": "ibm-granite/granite-embedding-small-english-r2",
     "embedding_model_id": "ibm-granite/granite-embedding-small-english-r2",
     "embedding_dimensions": 384,

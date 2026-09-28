@@ -241,16 +241,33 @@ class TestContentList:
             # source is a top-level column, not metadata['source']
             assert doc["source"] == "manual"
 
-    def test_list_with_limit(self, mock_config):
-        """Test limit parameter."""
-        # Write many docs
+    def test_list_with_limit(self, mock_config, monkeypatch):
+        """Test limit parameter.
+
+        The in-memory mock drops LIMIT for this WHERE shape (it counts the
+        literal status condition as a bound parameter). The old row-count
+        assertion only held because same-millisecond observation IDs used to
+        overwrite each other; the SQL LIMIT is checked here and the returned
+        row count against real PostgreSQL in tests/e2e/test_generated_ids_e2e.py.
+        """
+        import tools.content as content_module
+
         for i in range(10):
             content_write(content=f"Doc {i}", content_type="observation")
 
+        seen = []
+        real_query = content_module.execute_query
+
+        def spy(sql, params=None, **kwargs):
+            seen.append((sql, params))
+            return real_query(sql, params, **kwargs)
+
+        monkeypatch.setattr(content_module, "execute_query", spy)
         result = content_list(limit=5)
         assert result["success"]
-        assert len(result["documents"]) <= 5
-        assert result["returned"] <= 5
+        fetch_sql, fetch_params = seen[-1]
+        assert fetch_sql.rstrip().endswith("LIMIT %s")
+        assert fetch_params[-1] == 5
 
     def test_list_empty_collection(self, mock_config):
         """Test listing with empty database."""

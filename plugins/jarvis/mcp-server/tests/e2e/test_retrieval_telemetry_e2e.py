@@ -324,3 +324,57 @@ def test_shadow_failure_backs_off_and_can_be_requeued(e2e_config, monkeypatch):
             "FROM local.retrieval_events WHERE id = %s::uuid", (trace_id,),
         ).fetchone()
     assert (status, attempts, next_at) == ("pending", 0, None)
+
+
+def test_retention_deletes_in_capped_batches_and_keeps_labels(e2e_config, monkeypatch):
+    """Retention runs as bounded DELETE transactions with a per-run cap (an
+    unbounded one wrote ~117 MiB of WAL at once); candidates still cascade and
+    labeled traces are still exempt."""
+    import tools.retrieval_telemetry as telemetry
+    from tools.retrieval_telemetry import (
+        CandidateTrace, cleanup_expired, get_event, put_event_feedback, record_event,
+    )
+    from tools.schema import _get_pool
+
+    monkeypatch.setattr(telemetry, "_CLEANUP_BATCH_SIZE", 3)
+    monkeypatch.setattr(telemetry, "_CLEANUP_MAX_BATCHES", 2)
+    pool = _get_pool()  # record_event only writes once the pool exists
+
+    def trace(i: int) -> str:
+        return record_event(
+            purpose="context_injection", query=f"expired trace {i}",
+            candidates=[CandidateTrace(schema_name="local", doc_id=f"obs::{i}", vector_rank=1)],
+            funnel={}, latency={}, outcome="results", shadow_eligible=False,
+        )
+
+    expired = [trace(i) for i in range(7)]
+    labeled = trace(99)
+    fresh = trace(100)
+    assert all(expired) and labeled and fresh
+    put_event_feedback(labeled, {"verdict": "useful", "expected_missing_ids": []})
+    with pool.connection() as conn:
+        conn.execute(
+            "UPDATE local.retrieval_events SET expires_at = now() - interval '1 day' "
+            "WHERE id = ANY(%s::uuid[])",
+            (expired + [labeled],),
+        )
+        conn.commit()
+
+    assert cleanup_expired() == 6  # two batches of three, then the run stops
+    assert telemetry._cleanup_backlog_left(6) is True
+    assert cleanup_expired() == 1
+    assert cleanup_expired() == 0
+
+    assert all(get_event(e) is None for e in expired)
+    assert get_event(labeled) is not None
+    assert get_event(fresh) is not None
+    with pool.connection() as conn:
+        orphans = conn.execute(
+            "SELECT count(*) FROM local.retrieval_candidates c "
+            "WHERE NOT EXISTS (SELECT 1 FROM local.retrieval_events e WHERE e.id = c.event_id)"
+        ).fetchone()[0]
+        remaining = conn.execute(
+            "SELECT count(*) FROM local.retrieval_candidates WHERE event_id = ANY(%s::uuid[])",
+            (expired,),
+        ).fetchone()[0]
+    assert orphans == 0 and remaining == 0

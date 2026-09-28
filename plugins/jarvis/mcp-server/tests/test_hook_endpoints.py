@@ -398,3 +398,6 @@ def test_observation_dedup_takes_max_similarity_across_window(monkeypatch):
     assert captured.get("n_results", 1) > 1, (
         "dedup must fetch a candidate window, not a single top-relevance hit"
     )
+    # Similarity is the dedup signal; a host rerank per observation pushed
+    # healthy ingests past the 2s hook deadline.
+    assert captured.get("rerank") is False

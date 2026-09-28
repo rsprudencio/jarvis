@@ -367,7 +367,7 @@ source = { directory = "../../../lib/jarvis-common" }
 
 [[package]]
 name = "jarvis-obsidian"
-version = "1.0.0"
+version = "1.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "jarvis-common" },
@@ -383,7 +383,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "jarvis-common", directory = "../../../lib/jarvis-common" },
-    { name = "mcp", specifier = ">=1.0.0" },
+    { name = "mcp", specifier = ">=1.0.0,<2.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.0.0" },
 ]

@@ -11,6 +11,13 @@ HOOKS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "hooks-handlers"
 sys.path.insert(0, HOOKS_DIR)
 
 import hook_http_client
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolated_state_dir(tmp_path: Path, monkeypatch):
+    """post_json reads/writes the core-degraded marker; keep it off ~/.jarvis."""
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / ".jarvis"))
 
 
 def test_resolve_base_url_from_mcp_json(tmp_path: Path):

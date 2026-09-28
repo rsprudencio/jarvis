@@ -292,7 +292,8 @@ async def list_tools() -> list[Tool]:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    logger.info(f"Tool: {name}, args: {arguments}")
+    # Keys only: values carry commit messages, file paths and note text.
+    logger.info("Tool: %s, arg_keys: %s", name, sorted((arguments or {}).keys()))
 
     try:
         handler = _HANDLERS.get(name)

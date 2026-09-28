@@ -290,9 +290,10 @@ If observations aren't being captured:
 If `/recall` returns no results or indexing fails:
 
 1. **Check container**: `docker compose -f ~/.jarvis/docker-compose.yml ps` — should show healthy
-2. **Verify PG connection**: `curl localhost:8741/health` — should show `"postgres": {"status": "ok"}`
+2. **Verify PG connection**: `curl --max-time 2 localhost:8741/health` — should show `"postgres": {"status": "ok"}`. `recovering`, `unreachable` or `disk_full` means the database is down (often a full Docker VM disk: `docker system df`); see [docker/README.md → Database outage](docker/README.md#database-outage-disk-full--recovery-mode). Memory tools and hooks fail fast (503) until it recovers; queued auto-extract payloads replay afterwards.
 3. **Rebuild index**: Run `/jarvis-settings` → "Re-index vault"
 4. **Check stats**: Run `/jarvis-memory-stats` to see document count
+5. **Back up**: `plugins/jarvis/scripts/jarvis-transport.sh backup` dumps the embedded database to `~/.jarvis/backups` (newest 7 kept)
 
 ### Windows-Specific Issues
 

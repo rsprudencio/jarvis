@@ -8,10 +8,15 @@ Usage:
     uvicorn http_app:app --host 0.0.0.0 --port 8741
 """
 
+import asyncio
+import contextvars
+import functools
 import json
 import logging
 import os
+import re
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 # Mirror the sys.path setup from server.py so all tool imports resolve
@@ -22,6 +27,12 @@ from jarvis_common.mtls import patch_uvicorn_transport
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from server import server
 from system_prompt import _version as _VERSION
+from tools.schema import (
+    db_available as _db_available,
+    display_conninfo,
+    is_db_unavailable_error,
+    safe_db_error as _safe_err,
+)
 
 logger = logging.getLogger("jarvis-core")
 
@@ -37,36 +48,220 @@ session_manager = StreamableHTTPSessionManager(
     json_response=True,
 )
 
+# Hook clients give up at 2.5s (hook_http_client.DEFAULT_TIMEOUT_SECONDS).
+# Answer before they do, so a stalled DB yields a 503 the client can queue
+# instead of a timeout it can't tell apart from a lost write.
+HOOK_DEADLINE_SECONDS = 2.0
+_TELEMETRY_DEADLINE_SECONDS = 10.0
+_RETRY_AFTER_SECONDS = 10
+MAX_REQUEST_BODY_BYTES = 1024 * 1024
+# /mcp carries whole documents (jarvis_store content), so its cap is larger.
+MAX_MCP_BODY_BYTES = 16 * 1024 * 1024
+# Past a cap the rest of the body is still read (and dropped), up to this
+# much more, so the client gets its 413: answering with the body unread makes
+# the server close with data pending, which the client sees as a reset or a
+# broken pipe — indistinguishable from core being down.
+_MAX_DRAIN_BYTES = 16 * 1024 * 1024
+
+# Blocking hook/telemetry work (DB, model host) runs here: never on the event
+# loop — one 30s pool wait there froze /health and every hook for the whole
+# 2026-09-24 outage — and never on the default executor the background loops
+# share. wait_for abandons a stuck call at the deadline, but its thread keeps
+# its slot until the pool's own checkout timeout fires; the bound keeps a DB
+# outage from spawning threads without limit.
+_HOOK_WORKERS = 4
+_hook_executor: ThreadPoolExecutor | None = None
+
+
+def _get_hook_executor() -> ThreadPoolExecutor:
+    """Lazily create the hook executor (again after a lifespan shutdown)."""
+    global _hook_executor
+    if _hook_executor is None:
+        _hook_executor = ThreadPoolExecutor(
+            max_workers=_HOOK_WORKERS, thread_name_prefix="hook-db"
+        )
+    return _hook_executor
+
+
+def _shutdown_hook_executor() -> None:
+    """Drop queued hook work; don't wait on threads stuck behind a dead DB."""
+    global _hook_executor
+    executor, _hook_executor = _hook_executor, None
+    if executor is not None:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+class _DeadlineExceeded(Exception):
+    """A blocking call outlived its deadline (its thread may still be running)."""
+
+
+class _ClientDisconnected(Exception):
+    """The client hung up before sending the whole request body."""
+
+
+class _BodyTooLarge(Exception):
+    """The request body exceeds its cap (``limit``, in bytes)."""
+
+    def __init__(self, limit: int = MAX_REQUEST_BODY_BYTES):
+        super().__init__(limit)
+        self.limit = limit
+
+
+async def _run_blocking(fn, *args, deadline: float = HOOK_DEADLINE_SECONDS, **kwargs):
+    """Run a sync function on the hook executor, bounded by ``deadline``.
+
+    The caller's contextvars (current_user) are copied into the thread.
+    Raises _DeadlineExceeded on timeout; the function's own exceptions
+    (including its own TimeoutError) propagate unchanged.
+    """
+    loop = asyncio.get_running_loop()
+    call = functools.partial(contextvars.copy_context().run, fn, *args, **kwargs)
+    future = loop.run_in_executor(_get_hook_executor(), call)
+    try:
+        return await asyncio.wait_for(future, deadline)
+    except TimeoutError:
+        if future.cancelled():
+            raise _DeadlineExceeded() from None
+        raise
+
+
+# Headers worth an access-log line. Everything else — authorization, cookies,
+# x-jarvis-internal-token, session ids — never reaches the container log. The
+# deny pattern guards against a sensitive name being added to the allowlist.
+_ACCESS_LOG_HEADERS = frozenset({
+    "user-agent",
+    "content-type",
+    "content-length",
+    "accept",
+    "mcp-method",
+    "mcp-protocol-version",
+})
+_SENSITIVE_HEADER_RE = re.compile(r"auth|token|secret|key|cookie|passw|session", re.IGNORECASE)
+
+
+def _loggable_headers(scope) -> dict[str, str]:
+    """Allowlisted request headers for the access log."""
+    safe = {}
+    for raw_name, raw_value in scope.get("headers", []):
+        name = raw_name.decode("latin-1").lower()
+        if name in _ACCESS_LOG_HEADERS and not _SENSITIVE_HEADER_RE.search(name):
+            safe[name] = raw_value.decode("latin-1")
+    return safe
+
 
 # --- ASGI helpers ---
 
 
-async def _json_response(send, data: dict, status: int = 200):
+async def _json_response(send, data: dict, status: int = 200, headers: list | None = None):
     """Send a JSON response."""
     body = json.dumps(data).encode()
     await send(
         {
             "type": "http.response.start",
             "status": status,
-            "headers": [[b"content-type", b"application/json"]],
+            "headers": [[b"content-type", b"application/json"], *(headers or [])],
         }
     )
     await send({"type": "http.response.body", "body": body})
 
 
-async def _read_request_body(receive) -> bytes:
-    """Read full HTTP request body from ASGI receive channel."""
+async def _send_unavailable(send, data: dict):
+    """503 + Retry-After: nothing was processed, the caller should retry later."""
+    await _json_response(
+        send,
+        data,
+        status=503,
+        headers=[[b"retry-after", str(_RETRY_AFTER_SECONDS).encode()]],
+    )
+
+
+async def _send_hook_result(send, response):
+    """Send a hook result; a retryable one means "not done" and maps to 503."""
+    if isinstance(response, dict) and response.get("retryable") is True:
+        await _send_unavailable(send, response)
+        return
+    await _json_response(send, response)
+
+
+async def _send_hook_error(
+    send, exc: Exception, status: int = 500, timeout_response: dict | None = None
+):
+    """Map a hook failure to 503 (retryable) or ``status`` with sanitized text.
+
+    ``error_kind`` tells the hook client whether the database is the cause
+    ("db_unavailable": back off everywhere) or this one request was merely
+    slow ("deadline": retry this payload, keep serving the next prompt). A
+    deadline miss only counts as a DB outage while the breaker is open; with
+    a healthy database it is a slow model host or a busy executor, and the
+    endpoint's ``timeout_response`` (if any) is answered instead.
+    """
+    if isinstance(exc, _DeadlineExceeded):
+        if not _db_available():
+            await _send_unavailable(send, {
+                "success": False, "retryable": True, "error_kind": "db_unavailable",
+                "error": "database unavailable (timeout)",
+            })
+        elif timeout_response is not None:
+            await _json_response(send, timeout_response)
+        else:
+            await _send_unavailable(send, {
+                "success": False, "retryable": True, "error_kind": "deadline",
+                "error": f"request timed out after {HOOK_DEADLINE_SECONDS:g}s",
+            })
+    elif is_db_unavailable_error(exc):
+        reason = _safe_err(exc)
+        if reason.lower().startswith("database unavailable:"):
+            reason = reason[len("database unavailable:"):].strip()
+        await _send_unavailable(send, {
+            "success": False, "retryable": True, "error_kind": "db_unavailable",
+            "error": f"database unavailable: {reason}",
+        })
+    else:
+        await _json_response(send, {"success": False, "error": _safe_err(exc)}, status=status)
+
+
+async def _read_request_body(receive, limit: int = MAX_REQUEST_BODY_BYTES) -> bytes:
+    """Read full HTTP request body from ASGI receive channel.
+
+    Raises _ClientDisconnected on http.disconnect — uvicorn returns that
+    message without suspending once the client is gone, so looping on it
+    pins the event loop at 100% CPU — and _BodyTooLarge past ``limit``, once
+    the rest of the body (up to _MAX_DRAIN_BYTES more) has been drained.
+    """
     chunks = []
+    size = 0
     while True:
         message = await receive()
+        if message["type"] == "http.disconnect":
+            raise _ClientDisconnected()
         if message["type"] != "http.request":
             continue
         body = message.get("body", b"")
         if body:
-            chunks.append(body)
+            size += len(body)
+            if size > limit:
+                if size > limit + _MAX_DRAIN_BYTES:
+                    raise _BodyTooLarge(limit)
+                chunks = None  # draining: keep reading, keep nothing
+            else:
+                chunks.append(body)
         if not message.get("more_body", False):
             break
+    if chunks is None:
+        raise _BodyTooLarge(limit)
     return b"".join(chunks)
+
+
+def _replay_body(body: bytes, receive):
+    """An ASGI receive() that yields ``body`` once, then defers to ``receive``."""
+    pending = [{"type": "http.request", "body": body, "more_body": False}]
+
+    async def replay():
+        if pending:
+            return pending.pop()
+        return await receive()
+
+    return replay
 
 
 async def _read_json_body(receive) -> tuple[dict[str, Any] | None, str]:
@@ -106,12 +301,34 @@ async def _send_401(send, message: str):
 # --- Endpoint handlers ---
 
 
+_UNKNOWN_DB_STATUS = {"status": "unknown", "error": None, "checked_at": None, "free_bytes": None}
+
+
+def _cached_db_status() -> dict:
+    """The background probe's last verdict — a dict read, never a DB round-trip."""
+    try:
+        from tools.schema import get_db_status
+
+        status = dict(get_db_status())
+    except Exception:
+        return dict(_UNKNOWN_DB_STATUS)
+    if status.get("error"):
+        status["error"] = _safe_err(status["error"])
+    return status
+
+
 async def health_response(scope, receive, send):
-    """Minimal liveness check — no DB queries, no secrets, no auth required."""
+    """Liveness check — no DB queries, no secrets, no auth required.
+
+    Top-level status stays "ok" whenever the process answers (entrypoint,
+    compose healthcheck and statusline gate on it); DB state rides in
+    ``postgres``, cached by the background probe (server.db_status_probe_loop).
+    """
     await _json_response(send, {
         "status": "ok",
         "server": "jarvis-core",
         "version": _VERSION,
+        "postgres": _cached_db_status(),
     })
 
 
@@ -119,85 +336,93 @@ async def not_found(scope, receive, send):
     await _json_response(send, {"error": "Not found"}, status=404)
 
 
+def _collect_telemetry() -> dict:
+    """Build the /telemetry payload (blocking: queries PostgreSQL)."""
+    from jarvis_common.auth import get_auth_config
+    from tools.config import get_postgres_config, get_sync_config
+
+    # --- PostgreSQL status ---
+    cfg = get_postgres_config()
+
+    pg_status = "ok"
+    pg_info = {"host": display_conninfo(cfg["url"])}
+    try:
+        from tools.schema import execute_query
+        count_result = execute_query(
+            "SELECT count(*) AS cnt FROM local.memories WHERE status = 'active'",
+            fetch="one",
+        )
+        pg_info["doc_count"] = count_result["cnt"] if count_result else 0
+    except Exception as e:
+        pg_status = "disconnected"
+        pg_info["error"] = _safe_err(e)
+
+    data = {
+        "status": "ok" if pg_status == "ok" else "degraded",
+        "server": "jarvis-core",
+        "version": _VERSION,
+        "postgres": {**pg_info, "status": pg_status},
+    }
+
+    # --- Sync status ---
+    sync_cfg = get_sync_config()
+    if sync_cfg.get("enabled"):
+        from tools.sync_queue import get_queue_stats
+        from tools.schema import _get_pool
+
+        remotes = sync_cfg.get("remotes", {})
+        try:
+            pool = _get_pool()
+            queue_stats = get_queue_stats(pool)
+        except Exception:
+            queue_stats = {"error": "unavailable"}
+
+        data["sync"] = {
+            "enabled": True,
+            "strategy": sync_cfg.get("strategy", "first-match"),
+            "worker_interval_seconds": sync_cfg.get("worker_interval_seconds", 30),
+            "remotes": {name: {"configured": True} for name in remotes},
+            "queue": queue_stats,
+        }
+    else:
+        data["sync"] = {"enabled": False}
+
+    # --- Retrieval telemetry (best-effort; never degrades core health) ---
+    try:
+        from tools.retrieval_telemetry import get_summary
+
+        data["retrieval"] = get_summary(days=7)
+        data["retrieval"]["status"] = "ok"
+    except Exception as exc:
+        data["retrieval"] = {"status": "unavailable", "error": _safe_err(exc)}
+
+    # --- Auth status ---
+    auth_cfg = get_auth_config()
+    if auth_cfg is not None:
+        tokens = auth_cfg.get("tokens", {})
+        mtls_configured = bool(os.environ.get("JARVIS_TLS_CA"))
+        data["auth"] = {
+            "enabled": True,
+            "users": len(tokens) if isinstance(tokens, dict) else 0,
+            "mtls": mtls_configured and _mtls_patch_ok,
+        }
+    else:
+        data["auth"] = {"enabled": False}
+
+    return data
+
+
 async def telemetry_response(scope, receive, send):
     """GET /telemetry — full operational status (authenticated)."""
     try:
-        from jarvis_common.auth import get_auth_config
-        from tools.config import get_postgres_config, get_sync_config
-
-        # --- PostgreSQL status ---
-        cfg = get_postgres_config()
-        url = cfg["url"]
-        display_url = url.split("@")[-1] if "@" in url else url
-
-        pg_status = "ok"
-        pg_info = {"host": display_url}
-        try:
-            from tools.schema import execute_query
-            count_result = execute_query(
-                "SELECT count(*) AS cnt FROM local.memories WHERE status = 'active'",
-                fetch="one",
-            )
-            pg_info["doc_count"] = count_result["cnt"] if count_result else 0
-        except Exception as e:
-            pg_status = "disconnected"
-            pg_info["error"] = str(e)
-
-        data = {
-            "status": "ok" if pg_status == "ok" else "degraded",
-            "server": "jarvis-core",
-            "version": _VERSION,
-            "postgres": {**pg_info, "status": pg_status},
-        }
-
-        # --- Sync status ---
-        sync_cfg = get_sync_config()
-        if sync_cfg.get("enabled"):
-            from tools.sync_queue import get_queue_stats
-            from tools.schema import _get_pool
-
-            remotes = sync_cfg.get("remotes", {})
-            try:
-                pool = _get_pool()
-                queue_stats = get_queue_stats(pool)
-            except Exception:
-                queue_stats = {"error": "unavailable"}
-
-            data["sync"] = {
-                "enabled": True,
-                "strategy": sync_cfg.get("strategy", "first-match"),
-                "worker_interval_seconds": sync_cfg.get("worker_interval_seconds", 30),
-                "remotes": {name: {"configured": True} for name in remotes},
-                "queue": queue_stats,
-            }
-        else:
-            data["sync"] = {"enabled": False}
-
-        # --- Retrieval telemetry (best-effort; never degrades core health) ---
-        try:
-            from tools.retrieval_telemetry import get_summary
-
-            data["retrieval"] = get_summary(days=7)
-            data["retrieval"]["status"] = "ok"
-        except Exception as exc:
-            data["retrieval"] = {"status": "unavailable", "error": str(exc)}
-
-        # --- Auth status ---
-        auth_cfg = get_auth_config()
-        if auth_cfg is not None:
-            tokens = auth_cfg.get("tokens", {})
-            mtls_configured = bool(os.environ.get("JARVIS_TLS_CA"))
-            data["auth"] = {
-                "enabled": True,
-                "users": len(tokens) if isinstance(tokens, dict) else 0,
-                "mtls": mtls_configured and _mtls_patch_ok,
-            }
-        else:
-            data["auth"] = {"enabled": False}
-
-        await _json_response(send, data)
+        data = await _run_blocking(_collect_telemetry, deadline=_TELEMETRY_DEADLINE_SECONDS)
+    except _DeadlineExceeded:
+        await _send_unavailable(send, {"error": "telemetry unavailable (timeout)"})
+        return
     except Exception as e:
-        await _json_response(send, {"error": str(e)}, status=500)
+        await _json_response(send, {"error": _safe_err(e)}, status=500)
+        return
+    await _json_response(send, data)
 
 
 async def hook_prompt_context_response(scope, receive, send):
@@ -219,12 +444,17 @@ async def hook_prompt_context_response(scope, receive, send):
     try:
         from tools.hook_endpoints import get_prompt_context
 
-        response = get_prompt_context(prompt)
+        response = await _run_blocking(get_prompt_context, prompt)
     except Exception as e:
-        await _json_response(send, {"success": False, "error": str(e)}, status=500)
+        # Slow but healthy (model host, busy workers): inject nothing this
+        # once rather than make the client treat core as down.
+        await _send_hook_error(send, e, timeout_response={
+            "success": True, "matches": [], "timed_out": True,
+            "query_ms": int(HOOK_DEADLINE_SECONDS * 1000),
+        })
         return
 
-    await _json_response(send, response)
+    await _send_hook_result(send, response)
 
 
 async def retrieval_delivery_response(scope, receive, send, trace_id: str):
@@ -236,9 +466,9 @@ async def retrieval_delivery_response(scope, receive, send, trace_id: str):
     try:
         from tools.retrieval_telemetry import acknowledge_delivery
 
-        updated = acknowledge_delivery(trace_id, body)
+        updated = await _run_blocking(acknowledge_delivery, trace_id, body)
     except Exception as exc:
-        await _json_response(send, {"success": False, "error": str(exc)}, status=400)
+        await _send_hook_error(send, exc, status=400)
         return
     await _json_response(send, {"success": bool(updated), "trace_id": trace_id})
 
@@ -264,12 +494,14 @@ async def hook_auto_extract_context_response(scope, receive, send):
     try:
         from tools.hook_endpoints import get_auto_extract_context
 
-        response = get_auto_extract_context(workstream_limit=workstream_limit)
+        response = await _run_blocking(
+            get_auto_extract_context, workstream_limit=workstream_limit
+        )
     except Exception as e:
-        await _json_response(send, {"success": False, "error": str(e)}, status=500)
+        await _send_hook_error(send, e)
         return
 
-    await _json_response(send, response)
+    await _send_hook_result(send, response)
 
 
 async def hook_auto_extract_ingest_response(scope, receive, send):
@@ -314,12 +546,12 @@ async def hook_auto_extract_ingest_response(scope, receive, send):
     try:
         from tools.hook_endpoints import ingest_auto_extract
 
-        response = ingest_auto_extract(body)
+        response = await _run_blocking(ingest_auto_extract, body)
     except Exception as e:
-        await _json_response(send, {"success": False, "error": str(e)}, status=500)
+        await _send_hook_error(send, e)
         return
 
-    await _json_response(send, response)
+    await _send_hook_result(send, response)
 
 
 # --- ASGI app ---
@@ -340,9 +572,11 @@ async def app(scope, receive, send):
     path = scope.get("path", "")
     method = scope.get("method", "")
 
-    # Access log — shows every HTTP request hitting the server
-    headers_dict = {k.decode("latin-1"): v.decode("latin-1") for k, v in scope.get("headers", [])}
-    logger.info("[ACCESS] %s %s headers=%s", method, path, headers_dict)
+    # Access log — allowlisted headers only. /health is polled every few
+    # seconds (Docker healthcheck, statusline), so it only logs at DEBUG.
+    level = logging.DEBUG if path == "/health" else logging.INFO
+    if logger.isEnabledFor(level):
+        logger.log(level, "[ACCESS] %s %s headers=%s", method, path, _loggable_headers(scope))
 
     # Health check always open (Docker healthcheck, monitoring)
     if path == "/health" and method == "GET":
@@ -370,16 +604,29 @@ async def app(scope, receive, send):
         elif path == "/hook/auto-extract/ingest" and method == "POST":
             await hook_auto_extract_ingest_response(scope, receive, send)
         elif path == "/mcp" or path.startswith("/mcp/"):
+            if method == "POST":
+                # The SDK reads the whole body with no limit: read it here,
+                # capped, and hand the SDK a replay of it.
+                body = await _read_request_body(receive, limit=MAX_MCP_BODY_BYTES)
+                receive = _replay_body(body, receive)
             await session_manager.handle_request(scope, receive, send)
         else:
             await not_found(scope, receive, send)
+    except _ClientDisconnected:
+        # Nobody left to answer, and nothing was processed.
+        logger.debug("[ACCESS] %s %s client disconnected mid-body", method, path)
+    except _BodyTooLarge as exc:
+        await _json_response(
+            send,
+            {"success": False, "error": f"Request body exceeds {exc.limit} bytes"},
+            status=413,
+        )
     finally:
         current_user.reset(token)
 
 
 async def _handle_lifespan(scope, receive, send):
     """Handle ASGI lifespan events (startup/shutdown) with graceful drain."""
-    import asyncio
     from server import get_background_tasks
 
     _run_ctx = None
@@ -392,7 +639,7 @@ async def _handle_lifespan(scope, receive, send):
             try:
                 ensure_schema()
             except Exception as e:
-                logger.warning("Schema initialization deferred: %s", e)
+                logger.warning("Schema initialization deferred: %s", _safe_err(e))
             else:
                 try:
                     check_model_consistency()
@@ -407,14 +654,14 @@ async def _handle_lifespan(scope, receive, send):
                     await send({"type": "lifespan.startup.failed", "message": str(mme)})
                     raise
                 except Exception as e:
-                    logger.warning("Model consistency check deferred: %s", e)
+                    logger.warning("Model consistency check deferred: %s", _safe_err(e))
 
             # D6: Rebuild schema registry, auto-discovering existing remote_* schemas
             try:
                 from tools.schema_registry import rebuild_registry
                 rebuild_registry()
             except Exception as e:
-                logger.warning("Schema registry rebuild deferred: %s", e)
+                logger.warning("Schema registry rebuild deferred: %s", _safe_err(e))
 
             # Complete local model initialization before Uvicorn marks startup
             # complete. This keeps the first UserPromptSubmit request inside its
@@ -440,12 +687,18 @@ async def _handle_lifespan(scope, receive, send):
         elif message["type"] == "lifespan.shutdown":
             logger.info("[jarvis] Shutting down — cancelling background tasks...")
 
-            # Cancel background tasks (pattern detection, health probe, etc.)
+            # Cancel background tasks (pattern detection, DB status probe, etc.)
             for task in _bg_tasks:
                 if not task.done():
                     task.cancel()
 
             if _run_ctx:
                 await _run_ctx.__aexit__(None, None, None)
+
+            # Queued blocking work is dropped; threads stuck behind a dead DB
+            # are not waited on (they end at the pool's checkout timeout).
+            from server import shutdown_tool_executor
+            _shutdown_hook_executor()
+            shutdown_tool_executor()
             await send({"type": "lifespan.shutdown.complete"})
             return

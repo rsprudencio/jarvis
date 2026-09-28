@@ -21,6 +21,13 @@ from hook_http_client import post_json, put_json
 from harness import format_user_prompt_submit_output
 from precompact_dedup import compute_content_hash, filter_already_injected, write_injection_state
 
+# Core embeds and lexically matches only the head of a prompt (4000 chars for
+# the lexical channel, the model's token window for embeddings). A huge paste
+# sent whole blew past core's 1 MiB request cap, and the reset connection read
+# as "core unavailable" for every hook for a minute. Even at 12 bytes per
+# JSON-escaped character this stays far below the cap.
+MAX_PROMPT_CHARS = 32_000
+
 
 # --- Debug Logging ---
 
@@ -277,10 +284,12 @@ def main():
         sys.exit(0)
 
     # Fetch semantic context + per-prompt flags from local hook endpoint.
-    # This keeps retrieval bump and config resolution server-side.
+    # This keeps retrieval bump and config resolution server-side. While the
+    # core-degraded marker is fresh the client fails fast without a request,
+    # which lands in the memory-unavailable warning below.
     ctx_resp = post_json(
         "/hook/prompt-context",
-        {"prompt": prompt_text},
+        {"prompt": prompt_text[:MAX_PROMPT_CHARS]},
         timeout_seconds=2.5,
     )
 
@@ -312,6 +321,14 @@ def main():
             _debug_log("SKIP", "disabled")
         sys.exit(0)
 
+    # Core answered, but its database is down: the empty result is not a miss.
+    if ctx_resp.get("success") and result.get("degraded") is True:
+        output_parts.append(
+            _format_memory_unavailable_warning(
+                str(result.get("error") or "database unavailable")
+            )
+        )
+
     returned_matches = result.get("matches", [])
     matches = returned_matches
 
@@ -339,6 +356,8 @@ def main():
                     "delivered_candidate_keys": delivered_keys,
                 },
                 timeout_seconds=0.5,
+                # A slow ack under load is not an outage; don't trip the breaker.
+                trip_breaker=False,
             )
         except Exception:
             pass

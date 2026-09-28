@@ -192,12 +192,28 @@ def record_event(
             conn.commit()
         return event_id
     except Exception as exc:
+        # This is the most frequent writer, so it is usually the first to hit
+        # ENOSPC; note_db_error logs that at CRITICAL instead of a DEBUG line.
+        from .schema import note_db_error
+
+        note_db_error(exc)
         logger.debug("Retrieval telemetry write skipped: %s", exc)
         return None
 
 
 def acknowledge_delivery(trace_id: str, payload: dict) -> bool:
-    """Record what the hook actually emitted after session-level dedup."""
+    """Record what the hook actually emitted after session-level dedup.
+
+    Hook path: the checkout is bounded by HOOK_CONN_TIMEOUT, and an open
+    circuit breaker makes it fail immediately.
+    """
+    from .schema import HOOK_CONN_TIMEOUT, checkout_timeout
+
+    with checkout_timeout(HOOK_CONN_TIMEOUT):
+        return _acknowledge_delivery(trace_id, payload)
+
+
+def _acknowledge_delivery(trace_id: str, payload: dict) -> bool:
     try:
         from .schema import _get_pool
 
@@ -227,6 +243,9 @@ def acknowledge_delivery(trace_id: str, payload: dict) -> bool:
             conn.commit()
         return event_updated > 0
     except Exception as exc:
+        from .schema import note_db_error
+
+        note_db_error(exc)
         logger.debug("Retrieval delivery acknowledgement skipped: %s", exc)
         return False
 
@@ -1116,6 +1135,36 @@ def process_one_shadow_job() -> bool:
         return True
 
 
+_CLEANUP_INTERVAL_SECONDS = 86400
+_CLEANUP_RETRY_SECONDS = 300
+# Retention deletes in bounded transactions: each event takes ~50 candidate
+# rows with it, and one unbounded DELETE of a large backlog wrote ~117 MiB of
+# WAL in under a second (rehearsal: 5.7k events / 295k candidates). A run
+# stops after _CLEANUP_MAX_BATCHES; any remaining backlog continues
+# _CLEANUP_RETRY_SECONDS later, so its WAL is spread across checkpoints.
+_CLEANUP_BATCH_SIZE = 200
+_CLEANUP_MAX_BATCHES = 10
+
+_CLEANUP_BATCH_SQL = """
+    WITH doomed AS (
+        SELECT e.id FROM local.retrieval_events e
+         WHERE e.expires_at < now()
+           AND NOT EXISTS (
+               SELECT 1 FROM local.retrieval_feedback f
+                WHERE f.event_id = e.id)
+           AND NOT EXISTS (
+               SELECT 1 FROM local.retrieval_candidate_feedback cf
+                WHERE cf.event_id = e.id)
+         ORDER BY e.expires_at
+         LIMIT %s
+    ), deleted AS (
+        DELETE FROM local.retrieval_events e
+         USING doomed d
+         WHERE e.id = d.id
+        RETURNING 1
+    ) SELECT count(*) AS count FROM deleted"""
+
+
 def cleanup_expired() -> int:
     """Delete expired traces, but NEVER human-labeled ones.
 
@@ -1124,24 +1173,32 @@ def cleanup_expired() -> int:
     calibration work has. Labeled events are exempt from expiry entirely; the
     raw trace (candidate scores) IS the training data and must outlive the
     telemetry retention window.
-    """
-    from .schema import execute_query
 
-    row = execute_query(
-        """WITH deleted AS (
-               DELETE FROM local.retrieval_events e
-                WHERE e.expires_at < now()
-                  AND NOT EXISTS (
-                      SELECT 1 FROM local.retrieval_feedback f
-                       WHERE f.event_id = e.id)
-                  AND NOT EXISTS (
-                      SELECT 1 FROM local.retrieval_candidate_feedback cf
-                       WHERE cf.event_id = e.id)
-               RETURNING 1
-           ) SELECT count(*) AS count FROM deleted""",
-        fetch="one",
-    )
-    return int((row or {}).get("count", 0))
+    Deletes at most _CLEANUP_BATCH_SIZE events per transaction and
+    _CLEANUP_MAX_BATCHES batches per call; returns the number deleted.
+    """
+    from .schema import execute_write
+
+    batch_size = max(1, int(_CLEANUP_BATCH_SIZE))
+    total = 0
+    for _ in range(max(1, int(_CLEANUP_MAX_BATCHES))):
+        row = execute_write(_CLEANUP_BATCH_SQL, (batch_size,), returning=True)
+        deleted = int((row or {}).get("count", 0))
+        total += deleted
+        if deleted < batch_size:
+            break
+    return total
+
+
+def _cleanup_backlog_left(deleted: int) -> bool:
+    """True when the last cleanup_expired() hit its per-run cap."""
+    return deleted >= max(1, int(_CLEANUP_BATCH_SIZE)) * max(1, int(_CLEANUP_MAX_BATCHES))
+
+
+def _database_disk_full() -> bool:
+    from .schema import get_db_status
+
+    return get_db_status().get("status") == "disk_full"
 
 
 async def retrieval_telemetry_loop() -> None:
@@ -1152,7 +1209,10 @@ async def retrieval_telemetry_loop() -> None:
     shadow job can never stall the event loop that serves /hook/prompt-context
     and MCP traffic.
     """
-    last_cleanup = 0.0
+    # None = run the janitor on the first iteration. A 0.0 sentinel compared
+    # against time.monotonic() (time since the VM booted) meant retention never
+    # ran while uptime stayed under 24h.
+    last_cleanup: float | None = None
     while True:
         try:
             cfg = _config()
@@ -1161,18 +1221,47 @@ async def retrieval_telemetry_loop() -> None:
             rate = max(0.01, float(shadow.get("max_jobs_per_second", 1)))
             poll = max(poll, 1.0 / rate)
             await asyncio.to_thread(process_one_shadow_job)
-            if time.monotonic() - last_cleanup > 86400:
-                await asyncio.to_thread(cleanup_expired)
-                # Recover events whose attempts were exhausted by a transient
-                # model-host outage; bounded by age + retention, and attempts
-                # now carry real backoff between them.
-                requeued = await asyncio.to_thread(requeue_failed_shadow_jobs)
-                if requeued:
-                    logger.info("Requeued %d failed shadow scoring job(s)", requeued)
-                last_cleanup = time.monotonic()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.debug("Retrieval telemetry worker idle: %s", exc)
             poll = 5.0
+        # Retention has its own error handling: a failing shadow job must not
+        # starve cleanup (the telemetry tables are the fastest-growing data).
+        now = time.monotonic()
+        if last_cleanup is None or now - last_cleanup > _CLEANUP_INTERVAL_SECONDS:
+            try:
+                if _database_disk_full():
+                    # DELETEs write WAL and give no space back before VACUUM:
+                    # on a full volume they can only make things worse.
+                    logger.info(
+                        "Retention cleanup deferred %ds: PostgreSQL volume is full",
+                        _CLEANUP_RETRY_SECONDS,
+                    )
+                    last_cleanup = now - _CLEANUP_INTERVAL_SECONDS + _CLEANUP_RETRY_SECONDS
+                else:
+                    deleted = await asyncio.to_thread(cleanup_expired)
+                    if deleted:
+                        logger.info(
+                            "Retention cleanup deleted %d expired retrieval event(s)", deleted
+                        )
+                    # Recover events whose attempts were exhausted by a transient
+                    # model-host outage; bounded by age + retention, and attempts
+                    # now carry real backoff between them.
+                    requeued = await asyncio.to_thread(requeue_failed_shadow_jobs)
+                    if requeued:
+                        logger.info("Requeued %d failed shadow scoring job(s)", requeued)
+                    last_cleanup = time.monotonic()
+                    if _cleanup_backlog_left(deleted):
+                        # More expired than one run deletes: continue soon.
+                        last_cleanup += _CLEANUP_RETRY_SECONDS - _CLEANUP_INTERVAL_SECONDS
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Retrieval telemetry retention cleanup failed, retrying in %ds: %s",
+                    _CLEANUP_RETRY_SECONDS, exc,
+                )
+                # Due again in _CLEANUP_RETRY_SECONDS, not in a day.
+                last_cleanup = now - _CLEANUP_INTERVAL_SECONDS + _CLEANUP_RETRY_SECONDS
         await asyncio.sleep(poll)

@@ -11,16 +11,28 @@ Schemas:
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import logging
 import os
+import re
+import threading
+import time
 from typing import Any
+from urllib.parse import unquote
+
+import psycopg
+import psycopg_pool
 
 logger = logging.getLogger("jarvis-core")
 
 # Singleton pool state
 _pool = None
 _pool_cache_key: tuple | None = None
+# Hook and MCP handlers run in worker threads, so first use and a config-driven
+# replacement can race; the lock keeps it to one pool.
+_pool_lock = threading.Lock()
 
 # ── Schema SQL ────────────────────────────────────────────────────────
 
@@ -217,8 +229,12 @@ CREATE INDEX IF NOT EXISTS idx_retrieval_events_purpose
 CREATE INDEX IF NOT EXISTS idx_retrieval_events_shadow
     ON local.retrieval_events (shadow_status, created_at)
     WHERE shadow_status IN ('pending', 'running');
-CREATE INDEX IF NOT EXISTS idx_retrieval_candidates_event
-    ON local.retrieval_candidates (event_id, vector_rank);
+-- idx_retrieval_candidates_event (event_id, vector_rank) duplicated the primary
+-- key's leading event_id column: per-event lookups, the FK cascade and the
+-- feedback FK all use the PK, and sorting <=100 rows by vector_rank is trivial.
+-- It was ~10% of the database and a third of candidate write amplification (and
+-- the file that first hit ENOSPC). Idempotent drop for existing installs.
+DROP INDEX IF EXISTS local.idx_retrieval_candidates_event;
 CREATE INDEX IF NOT EXISTS idx_retrieval_candidate_doc
     ON local.retrieval_candidates (schema_name, doc_id);
 """
@@ -675,6 +691,642 @@ $$;
 """
 
 
+# ── Outage resilience: fail-fast pool, circuit breaker, cached probe ──
+#
+# 2026-09 outage: the Docker VM disk filled and the embedded PostgreSQL sat in
+# a crash/recovery loop for ~15h. Every checkout waited psycopg_pool's default
+# 30s, and one hook ingest chains up to 8 checkouts (240s). Three layers now
+# bound that:
+#   1. the pool fails fast: 10s by default (memory.pool_timeout_seconds) and
+#      HOOK_CONN_TIMEOUT on hook paths (checkout_timeout());
+#   2. a circuit breaker: once checkouts fail against an unreachable database,
+#      callers get DatabaseUnavailable immediately instead of paying the
+#      timeout again. One half-open trial every _BREAKER_OPEN_SECONDS, and any
+#      successful checkout (or probe) closes it;
+#   3. a cached probe (probe_db_status / get_db_status) that /health reports
+#      without touching the database on the request path.
+
+HOOK_CONN_TIMEOUT = 1.5  # seconds; below the hook clients' 2.5s deadline
+_DEFAULT_POOL_TIMEOUT = 10.0
+_POOL_MAX_WAITING = 32
+_POOL_RECONNECT_TIMEOUT = 60.0
+_POOL_CONNECT_TIMEOUT = 3
+# TCP keepalives and a TCP user timeout drop a connection whose peer vanished
+# (VM paused, network gone) instead of blocking on it forever. A peer that is
+# alive but frozen still ACKs, so callers keep their own deadlines too.
+_POOL_CONNECT_KWARGS = {
+    "connect_timeout": _POOL_CONNECT_TIMEOUT,
+    "keepalives": 1,
+    "keepalives_idle": 30,
+    "keepalives_interval": 10,
+    "keepalives_count": 3,
+}
+if psycopg.pq.version() >= 120000:  # libpq 12 added it; ignored where the OS lacks it
+    _POOL_CONNECT_KWARGS["tcp_user_timeout"] = 30_000  # ms
+_BREAKER_OPEN_SECONDS = 10.0
+_PROBE_CONNECT_TIMEOUT = 2
+_DISK_FULL_WINDOW_SECONDS = 300.0
+# A recent disk-full error stops forcing "disk_full" once this long has passed
+# without another one AND the database has shown it can write again (a
+# connected probe with measured free space above the minimum, or a committed
+# write). The full window then only applies when neither can be observed.
+_DISK_FULL_CLEAR_SECONDS = 60.0
+_DISK_FULL_MIN_FREE_BYTES = 64 * 1024 * 1024
+_DISK_FULL_LOG_INTERVAL_SECONDS = 60.0
+_DEFAULT_PGDATA = "/var/lib/postgresql/data"
+
+# SQLSTATE classes that mean "the server cannot serve this right now" rather
+# than "this statement is wrong": connection exceptions (08), transaction
+# rollback such as deadlock (40), insufficient resources incl. disk full (53),
+# operator intervention incl. recovery mode (57), system/IO errors (58). A
+# connection lost mid-query has no SQLSTATE at all.
+_TRANSIENT_SQLSTATE_CLASSES = ("08", "40", "53", "57", "58")
+_RECOVERY_MARKERS = (
+    "in recovery mode",
+    "the database system is starting up",
+    "not yet accepting connections",
+)
+_DSN_CREDENTIALS_RE = re.compile(r"(://[^/\s:@]*:)\S*@")
+# libpq names the server it failed to reach ('connection to server at "h"
+# (ip), port N failed: FATAL:  ...'). /health is unauthenticated, so the
+# reason is kept and the target dropped.
+_CONN_TARGET_RE = re.compile(
+    r'connection to server (?:at "[^"]*"(?: \([^)]*\))?, port \d+|on socket "[^"]*") failed:\s*'
+)
+_SEVERITY_PREFIX_RE = re.compile(r"^(?:FATAL|ERROR|PANIC):\s+")
+_PASSWORD_KV_RE = re.compile(r"(password\s*=\s*)('[^']*'|\S+)", re.IGNORECASE)
+# libpq's conninfo parser quotes the offending component verbatim; with an
+# unencoded '%' or space in the password that component IS the password
+# ('invalid percent-encoded token: "<password>"'). None of these messages is
+# worth showing, so they collapse to one fixed text.
+_CONNINFO_PARSE_ERROR_RE = re.compile(
+    r"invalid percent-encoded token|forbidden value %00 in percent-encoded value"
+    r'|unexpected spaces found in|missing "=" after|unterminated quoted string'
+    r"|invalid connection option|invalid URI|in URI\b|URI query parameter"
+    r'|invalid integer value .* for connection option|invalid \S+ value: "',
+    re.IGNORECASE,
+)
+INVALID_CONNINFO_MESSAGE = (
+    "invalid PostgreSQL connection string (check POSTGRES_URL / memory.postgres_url)"
+)
+_URI_USERINFO_RE = re.compile(
+    r"^[a-z][a-z0-9+.-]*://([^:/@\s]*):(.+)@[^@]*$", re.IGNORECASE | re.DOTALL
+)
+_KV_VALUE_RE = re.compile(r"(?:^|\s)(user|password)\s*=\s*('(?:[^'\\]|\\.)*'|\S+)", re.IGNORECASE)
+_MIN_REDACTED_SECRET_CHARS = 6
+# Passwords of the connection strings this process connects with (see
+# register_conninfo_secret); safe_db_error scrubs them from any text.
+_known_secrets: set[str] = set()
+
+
+def _conninfo_credentials(url: str) -> tuple[str | None, str | None]:
+    """(user, password) of a URI or key/value connection string, without libpq.
+
+    libpq cannot be asked: the strings that leak are the ones it can't parse.
+    """
+    text = url.strip()
+    match = _URI_USERINFO_RE.match(text)
+    if match:
+        return match.group(1), match.group(2)
+    values = {}
+    for key, raw in _KV_VALUE_RE.findall(text):
+        if len(raw) >= 2 and raw[0] == raw[-1] == "'":
+            raw = raw[1:-1].replace("\\'", "'").replace("\\\\", "\\")
+        values[key.lower()] = raw
+    return values.get("user"), values.get("password")
+
+
+def register_conninfo_secret(url: str | None) -> None:
+    """Remember the password of a connection string this process uses.
+
+    A last line of defense behind the pattern-based redaction: safe_db_error
+    replaces it (raw and percent-decoded) in any text. Short passwords and one
+    equal to the user name are skipped — scrubbing "jarvis" would mangle every
+    message that names the user or the database.
+    """
+    if not url:
+        return
+    user, password = _conninfo_credentials(url)
+    if not password:
+        return
+    for secret in {password, unquote(password)}:
+        if len(secret) >= _MIN_REDACTED_SECRET_CHARS and secret != user:
+            _known_secrets.add(secret)
+
+
+def redact_known_secrets(text: str) -> str:
+    """Replace every registered connection-string password in ``text``."""
+    for secret in sorted(_known_secrets, key=len, reverse=True):
+        if secret in text:
+            text = text.replace(secret, "***")
+    return text
+
+
+def is_conninfo_parse_error(text: str) -> bool:
+    """True for libpq's "can't parse this connection string" messages."""
+    return bool(_CONNINFO_PARSE_ERROR_RE.search(text))
+
+
+def display_conninfo(url: str | None) -> str:
+    """``host:port/dbname`` of a connection string, for logs and status output.
+
+    Never the password: a key/value DSN has no '@' to split on, and one libpq
+    can't parse is not echoed at all.
+    """
+    try:
+        from psycopg.conninfo import conninfo_to_dict
+
+        info = conninfo_to_dict(url or "")
+    except Exception:
+        return "(unparseable connection string)"
+    host = info.get("host") or info.get("hostaddr") or "localhost"
+    return f"{host}:{info.get('port') or 5432}/{info.get('dbname') or ''}"
+
+
+class DatabaseUnavailable(RuntimeError):
+    """PostgreSQL cannot serve this call right now.
+
+    Raised when the circuit breaker is open or a pool checkout fails. ``str()``
+    is sanitized (no conninfo, no password), so it is safe to return to clients.
+    """
+
+
+_checkout_timeout_var: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "jarvis_db_checkout_timeout", default=None
+)
+
+_breaker_lock = threading.Lock()
+_db_down_until: float | None = None
+_db_down_reason: str | None = None
+# Most recent failed connect, cleared by a successful connect or checkout.
+# Distinguishes "database unreachable" from "pool busy" on a PoolTimeout.
+_last_connect_error: str | None = None
+_last_disk_full_at: float | None = None
+_last_disk_full_log_at: float | None = None
+# Monotonic time of the most recent committed execute_write/execute_batch.
+_last_write_ok_at: float | None = None
+
+
+def _unknown_db_status() -> dict:
+    return {"status": "unknown", "error": None, "checked_at": None, "free_bytes": None}
+
+
+_db_status: dict = _unknown_db_status()
+
+
+@contextlib.contextmanager
+def checkout_timeout(seconds: float | None = HOOK_CONN_TIMEOUT):
+    """Bound every pool checkout made in this context to ``seconds``.
+
+    Hook paths wrap their work in this so a sick database costs them
+    ``HOOK_CONN_TIMEOUT`` per checkout instead of the pool default. Context
+    variables follow the caller into ``contextvars.copy_context().run`` and
+    ``asyncio.to_thread``; ``None`` restores the pool default.
+    """
+    token = _checkout_timeout_var.set(seconds)
+    try:
+        yield
+    finally:
+        _checkout_timeout_var.reset(token)
+
+
+def safe_db_error(exc: BaseException | str) -> str:
+    """One-line, credential-free rendering of a database error for clients/logs."""
+    msg = redact_known_secrets(" ".join(str(exc).split()))
+    if is_conninfo_parse_error(msg):
+        return INVALID_CONNINFO_MESSAGE
+    if msg.startswith("connection failed: "):
+        msg = msg[len("connection failed: "):]
+    msg = _CONN_TARGET_RE.sub("", msg)
+    msg = _SEVERITY_PREFIX_RE.sub("", msg)
+    msg = _DSN_CREDENTIALS_RE.sub(r"\1***@", msg)
+    msg = _PASSWORD_KV_RE.sub(r"\1***", msg)
+    return msg[:300] or type(exc).__name__
+
+
+class _SanitizePoolLogFilter(logging.Filter):
+    """psycopg_pool logs every failed connect verbatim ("error connecting in
+    'pool-1': <libpq error>"), conninfo parse errors quoting the password
+    included; its records go through safe_db_error like everything else."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            record.msg = safe_db_error(record.getMessage())
+            record.args = None
+        except Exception:
+            pass
+        return True
+
+
+logging.getLogger("psycopg.pool").addFilter(_SanitizePoolLogFilter())
+
+
+def _is_recovery_message(message: str) -> bool:
+    lowered = message.lower()
+    return any(marker in lowered for marker in _RECOVERY_MARKERS)
+
+
+def _is_disk_full(exc: BaseException) -> bool:
+    return (
+        isinstance(exc, psycopg.errors.DiskFull)
+        or getattr(exc, "sqlstate", None) == "53100"
+        or "no space left on device" in str(exc).lower()
+    )
+
+
+def is_db_unavailable_error(exc: BaseException) -> bool:
+    """True when ``exc`` means "retry later", not "this request is wrong".
+
+    Callers use it to tell a retryable outage (keep the payload) from a
+    permanent failure such as a constraint violation (drop it).
+    """
+    if isinstance(exc, DatabaseUnavailable):
+        return True
+    if isinstance(exc, (psycopg_pool.PoolTimeout, psycopg_pool.TooManyRequests)):
+        return True
+    if isinstance(exc, psycopg.OperationalError):
+        sqlstate = getattr(exc, "sqlstate", None)
+        return sqlstate is None or sqlstate[:2] in _TRANSIENT_SQLSTATE_CLASSES
+    return False
+
+
+def db_available() -> bool:
+    """False while the circuit breaker is open. Never blocks, never queries."""
+    with _breaker_lock:
+        return _db_down_until is None or time.monotonic() >= _db_down_until
+
+
+def db_unavailable_reason() -> str:
+    """Sanitized reason the breaker last opened, for client-facing errors."""
+    with _breaker_lock:
+        return _db_down_reason or "PostgreSQL is unreachable"
+
+
+def _trip_breaker(reason: str) -> None:
+    global _db_down_until, _db_down_reason
+    with _breaker_lock:
+        was_open = _db_down_until is not None
+        _db_down_until = time.monotonic() + _BREAKER_OPEN_SECONDS
+        _db_down_reason = reason
+    if not was_open:
+        logger.error(
+            "PostgreSQL unavailable; failing fast, retrying every %gs: %s",
+            _BREAKER_OPEN_SECONDS, reason,
+        )
+
+
+def _mark_db_up() -> None:
+    """A checkout or probe reached the database: close the breaker."""
+    global _db_down_until, _db_down_reason, _last_connect_error
+    with _breaker_lock:
+        was_open = _db_down_until is not None
+        _db_down_until = None
+        _db_down_reason = None
+        _last_connect_error = None
+    if was_open:
+        logger.warning("PostgreSQL reachable again; circuit breaker closed")
+
+
+def _enter_breaker() -> None:
+    """Raise while the breaker is open; let exactly one half-open trial through."""
+    global _db_down_until
+    with _breaker_lock:
+        if _db_down_until is None:
+            return
+        now = time.monotonic()
+        if now < _db_down_until:
+            raise DatabaseUnavailable(
+                f"{_db_down_reason or 'PostgreSQL is unreachable'} "
+                f"(circuit open, next retry in {_db_down_until - now:.0f}s)"
+            )
+        # Half-open: this caller is the trial. Everyone else keeps failing
+        # fast until it succeeds (_mark_db_up) or fails (_trip_breaker).
+        _db_down_until = now + _BREAKER_OPEN_SECONDS
+
+
+def _record_connect_error(exc: BaseException) -> None:
+    global _last_connect_error
+    note_db_error(exc)
+    with _breaker_lock:
+        _last_connect_error = safe_db_error(exc)
+
+
+def _record_connect_ok() -> None:
+    global _last_connect_error
+    with _breaker_lock:
+        _last_connect_error = None
+
+
+def _checkout_failed(exc: psycopg.OperationalError) -> DatabaseUnavailable:
+    """Classify a failed checkout, trip the breaker if the DB is the cause."""
+    with _breaker_lock:
+        connect_error = _last_connect_error
+    # TooManyRequests (max_waiting reached) is contention by definition; a
+    # PoolTimeout is too when the database still answers new connects.
+    if isinstance(exc, psycopg_pool.TooManyRequests) or (
+        isinstance(exc, psycopg_pool.PoolTimeout) and connect_error is None
+    ):
+        # Every connection is checked out and the database answers new
+        # connects: contention, not an outage. Fail this call only, so a slow
+        # reindex holding the pool cannot trip everyone else into fail-fast.
+        return DatabaseUnavailable(f"connection pool busy ({safe_db_error(exc)})")
+    reason = connect_error or safe_db_error(exc)
+    _trip_breaker(reason)
+    return DatabaseUnavailable(reason)
+
+
+def note_db_error(exc: BaseException) -> None:
+    """Report disk-full loudly and feed it into get_db_status().
+
+    The first ENOSPC of the 2026-09 outage left a single DEBUG line. Any caller
+    that swallows database errors should pass them through here first.
+    """
+    global _last_disk_full_at, _last_disk_full_log_at
+    if not _is_disk_full(exc):
+        return
+    now = time.monotonic()
+    with _breaker_lock:
+        _last_disk_full_at = now
+        should_log = (
+            _last_disk_full_log_at is None
+            or now - _last_disk_full_log_at >= _DISK_FULL_LOG_INTERVAL_SECONDS
+        )
+        if should_log:
+            _last_disk_full_log_at = now
+    reason = safe_db_error(exc)
+    _set_db_status(status="disk_full", error=f"PostgreSQL disk full: {reason}")
+    if should_log:
+        logger.critical(
+            "PostgreSQL DISK FULL (SQLSTATE 53100): writes are failing. Free "
+            "space on the PostgreSQL volume (docker system df) and restart "
+            "Jarvis. %s", reason,
+        )
+
+
+def _disk_full_seen_recently() -> bool:
+    with _breaker_lock:
+        seen = _last_disk_full_at
+    return seen is not None and time.monotonic() - seen < _DISK_FULL_WINDOW_SECONDS
+
+
+def note_db_write_ok() -> None:
+    """A write committed: evidence (for probe_db_status) that disk-full is over.
+
+    execute_write/execute_batch call it; so should code that commits on its
+    own pool connection.
+    """
+    global _last_write_ok_at
+    now = time.monotonic()
+    with _breaker_lock:
+        _last_write_ok_at = now
+
+
+def _clear_disk_full_if_recovered(connected: bool, space_ok: bool) -> bool:
+    """Forget a recent disk-full error once the database writes again.
+
+    Without this /health (and so the statusline and launcher) kept saying
+    "disk full" for the whole 5-minute window after space had been freed and
+    writes were succeeding. Requires _DISK_FULL_CLEAR_SECONDS without a new
+    disk-full error, so a volume that is still full does not flap to "ok"
+    between failed writes. Returns True when it cleared the error.
+    """
+    global _last_disk_full_at
+    if not connected:
+        return False
+    with _breaker_lock:
+        seen = _last_disk_full_at
+        if seen is None or time.monotonic() - seen < _DISK_FULL_CLEAR_SECONDS:
+            return False
+        wrote_since = _last_write_ok_at is not None and _last_write_ok_at > seen
+        if not (space_ok or wrote_since):
+            return False
+        _last_disk_full_at = None
+    logger.warning(
+        "PostgreSQL disk-full condition cleared: no disk-full error for %gs and %s",
+        _DISK_FULL_CLEAR_SECONDS,
+        "a write has succeeded since" if wrote_since else "the volume has free space again",
+    )
+    return True
+
+
+def _set_db_status(**fields: Any) -> None:
+    global _db_status
+    with _breaker_lock:
+        status = dict(_db_status)
+        status.update(fields)
+        status["checked_at"] = time.time()
+        _db_status = status
+
+
+def get_db_status() -> dict:
+    """Cached PostgreSQL status for /health. Never blocks, never queries.
+
+    Shape: ``{"status": "ok"|"recovering"|"unreachable"|"disk_full"|"unknown",
+    "error": str|None, "checked_at": float|None, "free_bytes": int|None}``.
+    Refreshed by probe_db_status() (and immediately by note_db_error).
+    """
+    with _breaker_lock:
+        return dict(_db_status)
+
+
+def _is_local_db(url: str) -> bool:
+    try:
+        from psycopg.conninfo import conninfo_to_dict
+
+        host = str(conninfo_to_dict(url).get("host") or "")
+    except Exception:
+        return False
+    return all(
+        not h or h.startswith("/") or h in ("localhost", "127.0.0.1", "::1")
+        for h in (part.strip() for part in host.split(","))
+    )
+
+
+def _pgdata_free_bytes(url: str | None) -> int | None:
+    """Free bytes on the embedded PGDATA volume, or None when not embedded."""
+    if not url or not _is_local_db(url):
+        return None
+    path = os.environ.get("PGDATA") or _DEFAULT_PGDATA
+    try:
+        if not os.path.isdir(path):
+            return None
+        st = os.statvfs(path)
+    except (OSError, AttributeError):
+        return None
+    return int(st.f_bavail * st.f_frsize)
+
+
+def probe_db_status() -> dict:
+    """BLOCKING probe of PostgreSQL health — run it in a worker thread.
+
+    Opens a direct connection (never the pool, whose checkout would wait the
+    pool timeout), asks ``pg_is_in_recovery()``, and reads free space on an
+    embedded PGDATA volume. Updates the get_db_status() cache and the circuit
+    breaker, and returns the new status. Never raises.
+    """
+    url = None
+    connected = False
+    status, error = "unreachable", None
+    try:
+        from .config import get_postgres_config
+
+        url = get_postgres_config()["url"]
+        register_conninfo_secret(url)
+        with psycopg.connect(
+            url, connect_timeout=_PROBE_CONNECT_TIMEOUT, autocommit=True
+        ) as conn:
+            row = conn.execute("SELECT pg_is_in_recovery()").fetchone()
+        connected = True
+        if row and row[0]:
+            status, error = "recovering", "the database is in recovery (read-only)"
+        else:
+            status = "ok"
+    except Exception as exc:
+        note_db_error(exc)
+        error = safe_db_error(exc)
+        status = "recovering" if _is_recovery_message(error) else "unreachable"
+
+    try:
+        free_bytes = _pgdata_free_bytes(url)
+    except Exception:
+        free_bytes = None
+    low_space = free_bytes is not None and free_bytes < _DISK_FULL_MIN_FREE_BYTES
+    _clear_disk_full_if_recovered(
+        connected and status == "ok",
+        space_ok=free_bytes is not None and not low_space,
+    )
+    if low_space or _disk_full_seen_recently():
+        detail = (
+            f"PostgreSQL volume has {free_bytes // (1024 * 1024)} MiB free"
+            if low_space
+            else "PostgreSQL reported disk full (SQLSTATE 53100) in the last "
+                 f"{_DISK_FULL_WINDOW_SECONDS / 60:.0f} min"
+        )
+        status, error = "disk_full", detail if error is None else f"{detail}; {error}"
+
+    if connected:
+        _mark_db_up()
+    else:
+        _trip_breaker(error or "PostgreSQL is unreachable")
+    _set_db_status(status=status, error=error, free_bytes=free_bytes)
+    return get_db_status()
+
+
+def mark_db_probe_stalled(seconds: float) -> None:
+    """The probe got no answer within ``seconds`` and its thread is stuck.
+
+    connect_timeout bounds only the connect; a server that accepts and then
+    never answers blocks the probe's query. The cached status must not keep
+    reporting the previous verdict meanwhile, and the breaker opens: without
+    it every hook would wait out its deadline on the frozen server, and a
+    deadline miss with the breaker closed reads as "slow", not "down".
+    """
+    reason = f"PostgreSQL did not answer the status probe within {seconds:g}s"
+    _trip_breaker(reason)
+    _set_db_status(status="unreachable", error=reason)
+
+
+def reset_breaker() -> None:
+    """Forget breaker, disk-full and probe state. Used by tests and reset_pool."""
+    global _db_down_until, _db_down_reason, _last_connect_error
+    global _last_disk_full_at, _last_disk_full_log_at, _last_write_ok_at, _db_status
+    with _breaker_lock:
+        _db_down_until = None
+        _db_down_reason = None
+        _last_connect_error = None
+        _last_disk_full_at = None
+        _last_disk_full_log_at = None
+        _last_write_ok_at = None
+        _db_status = _unknown_db_status()
+
+
+class _TrackedConnection(psycopg.Connection):
+    """Pool connection class that records why connects fail.
+
+    psycopg_pool only logs connect errors from its worker threads and reports a
+    bare "couldn't get a connection" to the caller; the recorded reason (e.g.
+    "the database system is in recovery mode") becomes the breaker's reason.
+    """
+
+    @classmethod
+    def connect(cls, conninfo: str = "", **kwargs: Any):
+        try:
+            conn = super().connect(conninfo, **kwargs)
+        except Exception as exc:
+            _record_connect_error(exc)
+            raise
+        _record_connect_ok()
+        return conn
+
+
+class _JarvisPool(psycopg_pool.ConnectionPool):
+    """ConnectionPool with context-scoped checkout timeouts and the breaker."""
+
+    def getconn(self, timeout: float | None = None):
+        if timeout is None:
+            timeout = _checkout_timeout_var.get()
+        _enter_breaker()
+        try:
+            conn = super().getconn(timeout=timeout)
+        except psycopg_pool.PoolClosed:
+            raise
+        except psycopg.OperationalError as exc:
+            # PoolTimeout and TooManyRequests are OperationalError subclasses
+            # (TooManyRequests is NOT a PoolTimeout).
+            raise _checkout_failed(exc) from exc
+        _mark_db_up()
+        return conn
+
+    @contextlib.contextmanager
+    def connection(self, timeout: float | None = None):
+        conn = None
+        try:
+            with super().connection(timeout=timeout) as conn:
+                yield conn
+        except DatabaseUnavailable:
+            raise
+        except psycopg.Error as exc:
+            note_db_error(exc)
+            # A connection that died mid-statement (server crash, admin
+            # shutdown) is the same outage signal as a failed checkout.
+            if isinstance(exc, psycopg.OperationalError) and conn is not None and conn.broken:
+                _trip_breaker(safe_db_error(exc))
+            raise
+
+
+def _configure_connection(conn) -> None:
+    """Pool configure step (pgvector types); a failure here is a connect failure.
+
+    _TrackedConnection records the connect as successful before this runs, so
+    without recording it a missing vector extension would read as "pool busy"
+    on every checkout and never trip the breaker.
+    """
+    from pgvector.psycopg import register_vector
+
+    try:
+        register_vector(conn)
+    except Exception as exc:
+        _record_connect_error(exc)
+        raise
+
+
+def _on_reconnect_failed(pool) -> None:
+    """psycopg_pool gave up reconnecting after reconnect_timeout."""
+    with _breaker_lock:
+        reason = _last_connect_error
+    _trip_breaker(reason or f"reconnection failed after {_POOL_RECONNECT_TIMEOUT:.0f}s")
+
+
+def _pool_timeout_seconds() -> float:
+    from .config import get_memory_config
+
+    try:
+        value = float(get_memory_config().get("pool_timeout_seconds", _DEFAULT_POOL_TIMEOUT))
+    except (TypeError, ValueError):
+        return _DEFAULT_POOL_TIMEOUT
+    return value if value > 0 else _DEFAULT_POOL_TIMEOUT
+
+
 def _get_pool():
     """Get or create singleton connection pool with config-based invalidation.
 
@@ -688,40 +1340,53 @@ def _get_pool():
     emb = get_embedding_config()
     key = (cfg["url"], emb["dimensions"])
 
-    if _pool is not None and _pool_cache_key == key:
+    pool = _pool
+    if pool is not None and _pool_cache_key == key:
+        return pool
+
+    with _pool_lock:
+        if _pool is not None and _pool_cache_key == key:
+            return _pool
+
+        if _pool is not None:
+            try:
+                _pool.close()
+            except Exception:
+                pass
+            reset_breaker()  # breaker state described the previous database
+
+        register_conninfo_secret(cfg["url"])
+        _pool = _JarvisPool(
+            conninfo=cfg["url"],
+            min_size=1,
+            max_size=5,
+            open=True,
+            configure=_configure_connection,
+            connection_class=_TrackedConnection,
+            kwargs=dict(_POOL_CONNECT_KWARGS),
+            timeout=_pool_timeout_seconds(),
+            max_waiting=_POOL_MAX_WAITING,
+            reconnect_timeout=_POOL_RECONNECT_TIMEOUT,
+            reconnect_failed=_on_reconnect_failed,
+            check=psycopg_pool.ConnectionPool.check_connection,
+        )
+        _pool_cache_key = key
+        logger.info("PostgreSQL connection pool created for %s", display_conninfo(cfg["url"]))
         return _pool
-
-    if _pool is not None:
-        try:
-            _pool.close()
-        except Exception:
-            pass
-
-    import psycopg_pool
-    from pgvector.psycopg import register_vector
-
-    _pool = psycopg_pool.ConnectionPool(
-        conninfo=cfg["url"],
-        min_size=1,
-        max_size=5,
-        open=True,
-        configure=lambda conn: register_vector(conn),
-    )
-    _pool_cache_key = key
-    logger.info("PostgreSQL connection pool created for %s", cfg["url"].split("@")[-1])
-    return _pool
 
 
 def reset_pool() -> None:
     """Close and reset the connection pool. Used in tests and config changes."""
     global _pool, _pool_cache_key
-    if _pool is not None:
-        try:
-            _pool.close()
-        except Exception:
-            pass
-    _pool = None
-    _pool_cache_key = None
+    with _pool_lock:
+        if _pool is not None:
+            try:
+                _pool.close()
+            except Exception:
+                pass
+        _pool = None
+        _pool_cache_key = None
+    reset_breaker()
 
 
 RENAME_SCHEMA_SQL = """\
@@ -822,11 +1487,19 @@ def ensure_schema() -> None:
 # ── Query helpers ─────────────────────────────────────────────────────
 
 
+def _checkout(pool, conn_timeout: float | None):
+    """``pool.connection()``, bounded by ``conn_timeout`` when given."""
+    if conn_timeout is None:
+        return pool.connection()
+    return pool.connection(timeout=conn_timeout)
+
+
 def execute_query(
     sql: str,
     params: tuple | dict | None = None,
     *,
     fetch: str = "all",
+    conn_timeout: float | None = None,
 ) -> Any:
     """Execute a SQL query and return results.
 
@@ -835,12 +1508,14 @@ def execute_query(
         params: Query parameters.
         fetch: "all" returns list of dicts, "one" returns single dict or None,
                "none" returns None (for INSERT/UPDATE/DELETE without RETURNING).
+        conn_timeout: Max seconds to wait for a pool connection (default: the
+            checkout_timeout() context, else the pool timeout).
 
     Returns:
         Query results as list of dicts, single dict, or None.
     """
     pool = _get_pool()
-    with pool.connection() as conn:
+    with _checkout(pool, conn_timeout) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             if fetch == "none":
@@ -859,6 +1534,7 @@ def execute_write(
     params: tuple | dict | None = None,
     *,
     returning: bool = False,
+    conn_timeout: float | None = None,
 ) -> dict | None:
     """Execute a write query (INSERT/UPDATE/DELETE).
 
@@ -866,12 +1542,13 @@ def execute_write(
         sql: SQL statement.
         params: Query parameters.
         returning: If True, fetch and return the RETURNING row as dict.
+        conn_timeout: Max seconds to wait for a pool connection.
 
     Returns:
         Dict of the RETURNING row if returning=True, else None.
     """
     pool = _get_pool()
-    with pool.connection() as conn:
+    with _checkout(pool, conn_timeout) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             result = None
@@ -881,12 +1558,15 @@ def execute_write(
                     columns = [desc.name for desc in cur.description]
                     result = dict(zip(columns, row))
             conn.commit()
+            note_db_write_ok()
             return result
 
 
 def execute_batch(
     sql: str,
     params_list: list[tuple],
+    *,
+    conn_timeout: float | None = None,
 ) -> int:
     """Execute a parameterized query for multiple parameter sets.
 
@@ -898,11 +1578,12 @@ def execute_batch(
     if not params_list:
         return 0
     pool = _get_pool()
-    with pool.connection() as conn:
+    with _checkout(pool, conn_timeout) as conn:
         with conn.cursor() as cur:
             cur.executemany(sql, params_list)
             count = cur.rowcount
             conn.commit()
+            note_db_write_ok()
             return count
 
 

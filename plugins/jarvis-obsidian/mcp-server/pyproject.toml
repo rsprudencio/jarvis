@@ -1,6 +1,6 @@
 [project]
 name = "jarvis-obsidian"
-version = "1.0.0"
+version = "1.0.1"
 description = "Jarvis Obsidian MCP Server - Git audit trail and PKM vault operations"
 requires-python = ">=3.11"
 dependencies = [

@@ -146,8 +146,10 @@ def test_health_endpoint(client):
     assert data["status"] == "ok"
     assert data["server"] == "jarvis-core"
     assert "version" in data
+    # The only DB detail is the background probe's cached verdict (never an
+    # inline query); the statusline and launcher read postgres.status.
+    assert set(data["postgres"]) >= {"status", "error", "checked_at", "free_bytes"}
     # Health must NOT contain operational details (those live on /telemetry)
-    assert "postgres" not in data
     assert "sync" not in data
     assert "auth" not in data
 

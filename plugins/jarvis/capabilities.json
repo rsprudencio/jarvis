@@ -592,7 +592,8 @@
       "importance_scoring": { "type": "boolean", "default": true, "description": "Enable importance scoring" },
       "recency_boost_days": { "type": "integer", "default": 7, "description": "Legacy key, no longer consumed — recency lives in memory_scoring.recency_half_life_days (index-time importance)" },
       "default_importance": { "type": "number", "default": 0.5, "description": "Default importance score (0.0-1.0) for new memories" },
-      "postgres_url": { "type": "string", "default": "postgresql://jarvis:jarvis@localhost:5432/jarvis", "description": "PostgreSQL connection URL for pgvector storage" }
+      "postgres_url": { "type": "string", "default": "postgresql://jarvis:jarvis@localhost:5432/jarvis", "description": "PostgreSQL connection URL for pgvector storage" },
+      "pool_timeout_seconds": { "type": "number", "default": 10, "description": "Max wait for a pooled PostgreSQL connection (hook paths use 1.5s). While the database is down a circuit breaker fails calls immediately and retries every ~10s" }
     },
 
     "memory_auto_extract": {
@@ -717,8 +718,10 @@
     },
 
     "shell_integration": {
-      "executable": "Standalone jarvis.sh script installed to PATH (e.g. ~/.local/bin/jarvis)",
-      "env_var": "__JARVIS_CLAUDE_STATUSLINE__=1 enables gold JARVIS indicator in statusline"
+      "executable": "Standalone jarvis.sh script installed to PATH (e.g. ~/.local/bin/jarvis); install.sh refreshes it (with a backup) on every run",
+      "env_var": "__JARVIS_CLAUDE_STATUSLINE__=1 enables gold JARVIS indicator in statusline",
+      "behavior": "Every probe is time-bounded and the launcher always ends in `exec claude`, even when Jarvis, PostgreSQL or Docker is down; it prints one stderr line saying why memory is degraded",
+      "launcher_overrides": ["JARVIS_CORE_URL (default http://localhost:8741)", "JARVIS_START_TIMEOUT (20s)", "JARVIS_COMPOSE_TIMEOUT (60s)", "JARVIS_DOCKER_TIMEOUT (5s)", "JARVIS_PLUGIN_CHECK_TIMEOUT (10s)", "JARVIS_SKIP_PLUGIN_CHECK=1"]
     }
   },
 
@@ -812,7 +815,10 @@
         "/vault": "User's Obsidian/markdown vault",
         "/config": "~/.jarvis/ (config.json + state)"
       },
-      "env_vars": ["JARVIS_HOME", "JARVIS_VAULT_PATH", "TODOIST_API_TOKEN", "JARVIS_AUTOCRLF"],
+      "env_vars": ["JARVIS_HOME", "JARVIS_VAULT_PATH", "TODOIST_API_TOKEN", "JARVIS_AUTOCRLF", "JARVIS_BIND_HOST"],
+      "bind_host": "MCP ports are published on 127.0.0.1 unless server.auth.enabled is true (JARVIS_BIND_HOST=0.0.0.0 in the repo compose); the explorer is always loopback",
+      "health": "GET /health is always HTTP 200 with status 'ok' while the server answers; postgres.status (ok|recovering|unreachable|disk_full|unknown) is the cached database state",
+      "backup": "plugins/jarvis/scripts/jarvis-transport.sh backup [N] writes a verified pg_dump to ~/.jarvis/backups (dir 700, files 600, other *.dump there tightened to 600) and keeps the newest N (default 7); JARVIS_COMPOSE_FILE overrides the compose file",
       "management": "~/.jarvis/jarvis-docker.sh {start|stop|restart|logs|status|update}",
       "note": "Plugin install still required for skills, agents, and MCP instructions. Docker is the standard deployment method."
     }

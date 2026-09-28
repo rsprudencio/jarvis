@@ -20,7 +20,16 @@ CORE_PID=""
 TODOIST_PID=""
 OBSIDIAN_PID=""
 EXPLORER_PID=""
+PG_WATCHDOG_PID=""
 PG_STARTED=false
+# Watchdog: exit (and let the restart policy restart the container) once
+# PostgreSQL has refused connections for INTERVAL x MAX_FAILS seconds, or
+# sooner (INTERVAL x GONE_FAILS) once no postgres process is left at all.
+PG_WATCHDOG_INTERVAL="${PG_WATCHDOG_INTERVAL:-10}"
+PG_WATCHDOG_MAX_FAILS="${PG_WATCHDOG_MAX_FAILS:-12}"
+PG_WATCHDOG_GONE_FAILS="${PG_WATCHDOG_GONE_FAILS:-3}"
+# Warn (never refuse to start) below this much free space on the PGDATA volume.
+PG_MIN_FREE_KB=1048576
 
 # --- Git configuration for mounted vault ---
 if [ -d "/vault" ]; then
@@ -58,27 +67,35 @@ JARVIS_INTERNAL_TOKEN="${JARVIS_INTERNAL_TOKEN:-$(python3 -c 'import secrets; pr
 export JARVIS_INTERNAL_TOKEN
 
 # --- Graceful shutdown ---
+# cleanup <exit-code>: the code is propagated so a crashed child (or the PG
+# watchdog) exits the container non-zero.
 cleanup() {
+    local rc="${1:-0}"
+    # A kill of an already-dead child must not abort cleanup under set -e
+    # (that used to skip the PostgreSQL stop entirely).
+    set +e
     echo "[jarvis] Shutting down..."
+    [ -n "$PG_WATCHDOG_PID" ] && kill "$PG_WATCHDOG_PID" 2>/dev/null
     [ -n "$CORE_PID" ] && kill "$CORE_PID" 2>/dev/null
     [ -n "$TODOIST_PID" ] && kill "$TODOIST_PID" 2>/dev/null
     [ -n "$OBSIDIAN_PID" ] && kill "$OBSIDIAN_PID" 2>/dev/null
     [ -n "$EXPLORER_PID" ] && kill "$EXPLORER_PID" 2>/dev/null
     # Wait up to 10s for jarvis-core to drain in-flight requests
     local timeout=10
-    while [ $timeout -gt 0 ] && kill -0 "$CORE_PID" 2>/dev/null; do
+    while [ $timeout -gt 0 ] && [ -n "$CORE_PID" ] && kill -0 "$CORE_PID" 2>/dev/null; do
         sleep 1
         timeout=$((timeout - 1))
     done
-    # Stop PostgreSQL after MCP servers are done
+    # Stop PostgreSQL after MCP servers are done. -t 15 keeps the total inside
+    # compose's 30s stop_grace_period (pg_ctl's default wait is 60s).
     if [ "$PG_STARTED" = "true" ]; then
         echo "[jarvis] Stopping embedded PostgreSQL..."
-        su postgres -c "pg_ctl stop -D '${PGDATA}' -m fast" 2>/dev/null || true
+        su postgres -c "pg_ctl stop -D '${PGDATA}' -m fast -t 15" 2>/dev/null || true
     fi
     echo "[jarvis] Shutdown complete."
-    exit 0
+    exit "$rc"
 }
-trap cleanup SIGTERM SIGINT
+trap 'cleanup 0' SIGTERM SIGINT
 
 # --- Check for Todoist token ---
 has_todoist_token() {
@@ -106,18 +123,20 @@ if [ "$TLS_ENABLED" = "true" ]; then
     CURL_TLS_FLAGS="-k"
 fi
 
+# wait_for_health <url> <name> [max-seconds]: a deadline, not a retry count.
+# Every probe is bounded, so a server that accepts TCP but never answers (a
+# wedged event loop) cannot stall startup past the deadline.
 wait_for_health() {
     local url="$1"
     local name="$2"
-    local max_retries="${3:-30}"
-    local i=0
+    local max_wait="${3:-30}"
+    local deadline=$((SECONDS + max_wait))
 
-    while [ $i -lt $max_retries ]; do
-        if curl -sf $CURL_TLS_FLAGS "${url}" > /dev/null 2>&1; then
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if curl -sf --connect-timeout 1 --max-time 2 $CURL_TLS_FLAGS "${url}" > /dev/null 2>&1; then
             echo "[jarvis] ${name} is ready"
             return 0
         fi
-        i=$((i + 1))
         sleep 1
     done
     echo "[jarvis] ERROR: ${name} failed to start"
@@ -125,8 +144,99 @@ wait_for_health() {
 }
 
 # --- Embedded PostgreSQL ---
+# pg_isready as the postgres role: the default (root) makes the server log
+# 'role "root" does not exist' on every probe.
+pg_ready() {
+    pg_isready -h 127.0.0.1 -p 5432 -U postgres -d postgres -t 3 -q 2>/dev/null
+}
+
+# True when any process named postgres is alive. Scans /proc on Linux so it
+# does not depend on procps; pgrep elsewhere (tests on macOS).
+postgres_running() {
+    local comm
+    if [ -d /proc/1 ]; then
+        for comm in /proc/[0-9]*/comm; do
+            [ "$(cat "$comm" 2>/dev/null)" = "postgres" ] && return 0
+        done
+        return 1
+    fi
+    pgrep -x postgres >/dev/null 2>&1
+}
+
+# A postmaster.pid left by a SIGKILLed container. Removed only when no
+# postgres process exists AND the pid recorded in it is not alive.
+remove_stale_postmaster_pid() {
+    local pidfile="${PGDATA}/postmaster.pid"
+    local pid
+    [ -f "$pidfile" ] || return 0
+    postgres_running && return 0
+    pid=$(head -n 1 "$pidfile" 2>/dev/null | tr -cd '0-9')
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+    echo "[jarvis] Removing stale postmaster.pid (pid ${pid:-unknown} is not running)"
+    rm -f "$pidfile"
+}
+
+# Warn only: a nearly-full volume can still serve reads, so never refuse to
+# start on free space alone. pg_ctl failing is what stops the container.
+warn_low_disk() {
+    local avail_kb
+    avail_kb=$(df -Pk "${PGDATA}" 2>/dev/null | awk 'NR==2 {print $4}')
+    case "$avail_kb" in ''|*[!0-9]*) return 0 ;; esac
+    if [ "$avail_kb" -lt "$PG_MIN_FREE_KB" ]; then
+        echo "[jarvis] WARNING: only $((avail_kb / 1024)) MiB free on the PostgreSQL volume — free Docker disk space (docker system df)" >&2
+        df -h "${PGDATA}" >&2 || true
+    fi
+}
+
+# Supervise the daemonized postmaster (pg_ctl detaches it, so `wait -n` can't
+# see it). A tracked job that exits once PG has been unavailable for
+# INTERVAL x MAX_FAILS seconds, so a crash/recovery loop restarts the
+# container instead of leaving it 'Up' with a dead database. In-place crash
+# recovery (restart_after_crash=on) still handles transient backend crashes.
+# Once no postgres process exists at all (postmaster exited: WAL PANIC then a
+# failed startup, kill -9) nothing inside the container will bring it back,
+# so it exits after INTERVAL x GONE_FAILS instead: freeing disk space then
+# brings the database back in ~30s rather than ~2 min.
+start_pg_watchdog() {
+    (
+        fails=0
+        gone=0
+        while sleep "$PG_WATCHDOG_INTERVAL"; do
+            if pg_ready; then
+                fails=0
+                gone=0
+            else
+                fails=$((fails + 1))
+                if postgres_running; then
+                    gone=0
+                else
+                    gone=$((gone + 1))
+                fi
+            fi
+            if [ "$gone" -ge "$PG_WATCHDOG_GONE_FAILS" ]; then
+                echo "[jarvis] FATAL: PostgreSQL is not running (no postgres process for ${gone} checks, ${PG_WATCHDOG_INTERVAL}s apart; server exited — disk full?)" >&2
+                df -h "${PGDATA}" >&2 || true
+                exit 1
+            fi
+            if [ "$fails" -ge "$PG_WATCHDOG_MAX_FAILS" ]; then
+                echo "[jarvis] FATAL: PostgreSQL not accepting connections for ${fails} checks, ${PG_WATCHDOG_INTERVAL}s apart (crash/recovery loop? disk full?)" >&2
+                df -h "${PGDATA}" >&2 || true
+                exit 1
+            fi
+        done
+    ) &
+    PG_WATCHDOG_PID=$!
+}
+
 start_embedded_postgres() {
     echo "[jarvis] Starting embedded PostgreSQL..."
+
+    # A PANIC would otherwise write a core the size of shared memory into
+    # PGDATA (the postmaster's cwd) — on the volume that is already full.
+    ulimit -c 0
+    [ -f "${PGDATA}/core" ] && rm -f "${PGDATA}/core"
 
     # Ensure data directory exists with correct ownership
     mkdir -p "${PGDATA}"
@@ -162,14 +272,26 @@ PGHBA
         chown postgres:postgres "${PGDATA}/postgresql.conf" "${PGDATA}/pg_hba.conf"
     fi
 
-    # Start PostgreSQL
-    su postgres -c "pg_ctl start -D '${PGDATA}' -l '${PGDATA}/postgresql.log' -w -t 30"
+    remove_stale_postmaster_pid
+    warn_low_disk
+
+    # Start PostgreSQL. No -l: server output goes to the container log (bounded
+    # by the compose logging options) instead of a file inside PGDATA, which
+    # stops being writable exactly when the volume fills. (-l /dev/stderr is
+    # not an option: re-opening root's stderr pipe as postgres fails EACCES.)
+    # Explicit `if !` because under set -e a failing pg_ctl used to exit before
+    # any diagnostics ran.
+    if ! su postgres -c "pg_ctl start -D '${PGDATA}' -w -t 30"; then
+        echo "[jarvis] ERROR: PostgreSQL failed to start (server output above)" >&2
+        df -h "${PGDATA}" >&2 || true
+        exit 1
+    fi
     PG_STARTED=true
 
     # Wait for pg_isready
     local i=0
     while [ $i -lt 30 ]; do
-        if pg_isready -h 127.0.0.1 -p 5432 -q 2>/dev/null; then
+        if pg_ready; then
             echo "[jarvis] PostgreSQL is ready"
             break
         fi
@@ -178,8 +300,8 @@ PGHBA
     done
 
     if [ $i -eq 30 ]; then
-        echo "[jarvis] ERROR: PostgreSQL failed to start within 30s" >&2
-        cat "${PGDATA}/postgresql.log" >&2
+        echo "[jarvis] ERROR: PostgreSQL failed to start within 30s (server output above)" >&2
+        df -h "${PGDATA}" >&2 || true
         exit 1
     fi
 
@@ -229,14 +351,27 @@ GRANTS
 
 # --- Wait for external PostgreSQL ---
 wait_for_external_postgres() {
-    echo "[jarvis] Using external PostgreSQL: ${POSTGRES_URL%%@*}@***"
+    # Log the host part only: the userinfo and a ?password= parameter both
+    # carry the secret (`${POSTGRES_URL%%@*}` used to print user:password).
+    local pg_where="(conninfo)"
+    case "$POSTGRES_URL" in
+        *://*)
+            pg_where="${POSTGRES_URL#*://}"
+            pg_where="${pg_where##*@}"
+            pg_where="${pg_where%%\?*}"
+            ;;
+    esac
+    echo "[jarvis] Using external PostgreSQL: ${pg_where}"
     echo "[jarvis] Waiting for PostgreSQL..."
     local pg_ready=false
     for i in $(seq 1 30); do
-        if python3 -c "
+        # Via the environment, not spliced into the source: a quote in the
+        # URL broke the script, and argv/source are visible in the process list.
+        if POSTGRES_URL="$POSTGRES_URL" python3 -c "
+import os
 import psycopg
 try:
-    conn = psycopg.connect('$POSTGRES_URL', connect_timeout=2)
+    conn = psycopg.connect(os.environ['POSTGRES_URL'], connect_timeout=2)
     conn.execute('SELECT 1')
     conn.close()
 except Exception:
@@ -255,9 +390,16 @@ except Exception:
     fi
 }
 
+# Tests source this file for its functions only (tests/test_deploy_scripts.py).
+if [ "${JARVIS_ENTRYPOINT_LIB_ONLY:-}" = "1" ]; then
+    # shellcheck disable=SC2317  # exit is reached when executed, not sourced
+    return 0 2>/dev/null || exit 0
+fi
+
 # --- Start PostgreSQL (embedded or wait for external) ---
 if [ -z "${POSTGRES_URL}" ]; then
     start_embedded_postgres
+    start_pg_watchdog
     export POSTGRES_URL="postgresql://postgres@127.0.0.1:5432/jarvis"
 else
     wait_for_external_postgres
@@ -345,7 +487,10 @@ uvicorn app:app \
 EXPLORER_PID=$!
 
 wait_for_health "${HEALTH_SCHEME}://localhost:${OBSIDIAN_PORT}/health" "jarvis-obsidian" 30
-wait_for_health "${HEALTH_SCHEME}://localhost:${EXPLORER_PORT}/health" "memory-explorer" 30
+# Non-fatal: the explorer is a read-only UI. Aborting here would restart-loop
+# the whole container (MCP servers included) over a slow explorer startup.
+wait_for_health "${HEALTH_SCHEME}://localhost:${EXPLORER_PORT}/health" "memory-explorer" 30 \
+    || echo "[jarvis] WARNING: memory-explorer not ready yet; continuing without waiting" >&2
 
 if [ -n "$TODOIST_PID" ]; then
     wait_for_health "${HEALTH_SCHEME}://localhost:${TODOIST_PORT}/health" "jarvis-todoist" 30
@@ -353,8 +498,10 @@ fi
 
 echo "[jarvis] All services started successfully."
 
-# --- Wait for any process to exit, then shutdown ---
-wait -n
-EXIT_CODE=$?
+# --- Wait for any process (or the PG watchdog) to exit, then shutdown ---
+# `|| EXIT_CODE=$?`: a bare non-zero `wait -n` under set -e would exit here and
+# skip cleanup (and the PostgreSQL stop).
+EXIT_CODE=0
+wait -n || EXIT_CODE=$?
 echo "[jarvis] A process exited with code ${EXIT_CODE}, shutting down..."
-cleanup
+cleanup "$EXIT_CODE"
